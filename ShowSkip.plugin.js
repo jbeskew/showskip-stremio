@@ -2,7 +2,7 @@
  * @name ShowSkip
  * @description Per-show segment skipping and next-episode rules for Stremio Enhanced.
  * @updateUrl none
- * @version 0.1.0
+ * @version 0.1.1
  * @author ShowSkip contributors
  */
 
@@ -54,6 +54,21 @@
             labels: ["At credits", "After credits", "Button", "Stremio default", "Never"],
         }),
     ]);
+
+    const PANEL_PALETTE = Object.freeze({
+        surface: "#211e2c",
+        primaryText: "#f8f7fb",
+        secondaryText: "#dedbe8",
+        optionText: "#f2eff8",
+        selectedText: "#ffffff",
+        selectedSurface: "#6745c7",
+        disabledText: "#bcb7c8",
+        disabledSelectedSurface: "#493c63",
+        controlSurface: "#302c3e",
+        controlHover: "#3b364a",
+        selectedHover: "#7655d6",
+        focusRing: "#b79cff",
+    });
 
     const OWNED_SELECTOR = "[data-showskip-owned]";
     const LAUNCHER_SELECTOR = "[data-showskip-launcher]";
@@ -907,10 +922,16 @@
                 border-color: rgba(255, 255, 255, 0.28);
                 transform: translateY(-1px);
             }
-            [data-showskip-launcher]:focus-visible,
-            [data-showskip-panel] .showskip-choice-input:focus-visible + .showskip-choice-label,
-            [data-showskip-panel] .showskip-close:focus-visible {
+            [data-showskip-launcher]:focus-visible {
                 outline: 2px solid var(--primary-accent-color, #9c7cff);
+                outline-offset: 3px;
+            }
+            [data-showskip-panel] .showskip-choice-input:focus-visible + .showskip-choice-label {
+                outline: 2px solid var(--showskip-primary-text);
+                outline-offset: -2px;
+            }
+            [data-showskip-panel] .showskip-close:focus-visible {
+                outline: 2px solid var(--showskip-focus-ring);
                 outline-offset: 3px;
             }
             [data-showskip-launcher] svg {
@@ -919,6 +940,18 @@
                 fill: currentColor;
             }
             [data-showskip-panel] {
+                --showskip-surface: ${PANEL_PALETTE.surface};
+                --showskip-primary-text: ${PANEL_PALETTE.primaryText};
+                --showskip-secondary-text: ${PANEL_PALETTE.secondaryText};
+                --showskip-option-text: ${PANEL_PALETTE.optionText};
+                --showskip-selected-text: ${PANEL_PALETTE.selectedText};
+                --showskip-selected-surface: ${PANEL_PALETTE.selectedSurface};
+                --showskip-disabled-text: ${PANEL_PALETTE.disabledText};
+                --showskip-disabled-selected-surface: ${PANEL_PALETTE.disabledSelectedSurface};
+                --showskip-control-surface: ${PANEL_PALETTE.controlSurface};
+                --showskip-control-hover: ${PANEL_PALETTE.controlHover};
+                --showskip-selected-hover: ${PANEL_PALETTE.selectedHover};
+                --showskip-focus-ring: ${PANEL_PALETTE.focusRing};
                 position: fixed;
                 z-index: 10000;
                 box-sizing: border-box;
@@ -926,13 +959,14 @@
                 max-height: min(38rem, calc(100vh - 1.5rem));
                 overflow: auto;
                 padding: 1rem;
-                color: var(--primary-foreground-color, #f7f5ff);
-                background: var(--primary-background-color, rgba(25, 23, 34, 0.96));
+                color: var(--showskip-primary-text);
+                background: var(--showskip-surface);
                 border: 1px solid rgba(255, 255, 255, 0.14);
                 border-radius: 1rem;
                 box-shadow: 0 1rem 3rem rgba(0, 0, 0, 0.42);
                 font: inherit;
                 backdrop-filter: blur(18px);
+                color-scheme: dark;
             }
             [data-showskip-panel] .showskip-header {
                 display: flex;
@@ -943,13 +977,14 @@
             }
             [data-showskip-panel] .showskip-title {
                 margin: 0;
+                color: var(--showskip-primary-text);
                 font-size: 1.05rem;
                 font-weight: 650;
                 line-height: 1.25;
             }
             [data-showskip-panel] .showskip-subtitle {
                 margin: 0.18rem 0 0;
-                color: var(--secondary-foreground-color, rgba(255, 255, 255, 0.64));
+                color: var(--showskip-secondary-text);
                 font-size: 0.78rem;
             }
             [data-showskip-panel] .showskip-close {
@@ -962,7 +997,7 @@
                 padding: 0;
                 border: 0;
                 border-radius: 50%;
-                color: inherit;
+                color: var(--showskip-primary-text);
                 background: rgba(255, 255, 255, 0.08);
                 cursor: pointer;
                 font: inherit;
@@ -982,11 +1017,16 @@
             }
             [data-showskip-panel] .showskip-row-title {
                 display: block;
+                float: none;
+                box-sizing: border-box;
+                width: 100%;
                 margin: 0 0 0.36rem;
                 padding: 0;
-                color: var(--secondary-foreground-color, rgba(255, 255, 255, 0.72));
-                font-size: 0.76rem;
-                font-weight: 600;
+                color: var(--showskip-secondary-text);
+                font-size: 0.78rem;
+                font-weight: 650;
+                line-height: 1.3;
+                letter-spacing: 0.01em;
             }
             [data-showskip-panel] .showskip-choice-group {
                 display: grid;
@@ -995,7 +1035,8 @@
                 gap: 0.22rem;
                 padding: 0.22rem;
                 border-radius: 0.72rem;
-                background: rgba(255, 255, 255, 0.055);
+                background: var(--showskip-control-surface);
+                box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
             }
             [data-showskip-panel] .showskip-choice-input {
                 position: absolute;
@@ -1013,21 +1054,37 @@
                 min-width: 0;
                 padding: 0.48rem 0.34rem;
                 border-radius: 0.54rem;
-                color: var(--secondary-foreground-color, rgba(255, 255, 255, 0.68));
+                color: var(--showskip-option-text);
                 text-align: center;
                 font-size: 0.72rem;
+                font-weight: 550;
                 line-height: 1.15;
                 cursor: pointer;
                 user-select: none;
+                transition: color 120ms ease, background-color 120ms ease;
+            }
+            [data-showskip-panel] .showskip-choice-input:not(:checked):not(:disabled) + .showskip-choice-label:hover {
+                background: var(--showskip-control-hover);
             }
             [data-showskip-panel] .showskip-choice-input:checked + .showskip-choice-label {
-                color: #fff;
-                background: var(--primary-accent-color, rgba(123, 91, 245, 0.92));
+                color: var(--showskip-selected-text);
+                background: var(--showskip-selected-surface);
                 box-shadow: 0 0.2rem 0.7rem rgba(0, 0, 0, 0.2);
+                font-weight: 600;
+            }
+            [data-showskip-panel] .showskip-choice-input:checked:not(:disabled) + .showskip-choice-label:hover {
+                background: var(--showskip-selected-hover);
+            }
+            [data-showskip-panel] .showskip-choice-input:disabled + .showskip-choice-label {
+                color: var(--showskip-disabled-text);
+                cursor: not-allowed;
+            }
+            [data-showskip-panel] .showskip-choice-input:checked:disabled + .showskip-choice-label {
+                background: var(--showskip-disabled-selected-surface);
             }
             [data-showskip-panel] .showskip-note {
                 margin: 0.72rem 0 0;
-                color: var(--secondary-foreground-color, rgba(255, 255, 255, 0.58));
+                color: var(--showskip-secondary-text);
                 font-size: 0.72rem;
                 line-height: 1.35;
             }
@@ -1042,7 +1099,7 @@
                 }
                 [data-showskip-panel] .showskip-choice-label {
                     padding-inline: 0.22rem;
-                    font-size: 0.68rem;
+                    font-size: 0.7rem;
                 }
             }
             @media screen and (max-width: 1000px) and (max-height: 500px) and (orientation: landscape) {
@@ -1290,8 +1347,10 @@
         _createChoiceRow(row, suffix) {
             const fieldset = this.document.createElement("fieldset");
             fieldset.className = "showskip-row";
+            fieldset.setAttribute("data-showskip-setting-row", row.field);
             const legend = this.document.createElement("legend");
             legend.className = "showskip-row-title";
+            legend.setAttribute("data-showskip-row-label", row.field);
             legend.textContent = row.label;
             const group = this.document.createElement("div");
             group.className = "showskip-choice-group";
@@ -1309,6 +1368,7 @@
 
                 const label = this.document.createElement("label");
                 label.className = "showskip-choice-label";
+                label.setAttribute("data-showskip-option-label", value);
                 label.htmlFor = id;
                 label.textContent = row.labels[index];
                 group.append(input, label);
@@ -1689,10 +1749,14 @@
             value: Object.freeze({
                 LIMITS,
                 DEFAULT_PROFILE_VALUES,
+                PANEL_PALETTE,
+                PANEL_ROWS,
                 ProfileStore,
                 CoalescedScheduler,
+                ShowPageController,
                 canonicalShowKey,
                 createDefaultProfile,
+                createStyles,
                 ensureSingleOwnedNode,
                 inspectJsonValue,
                 normalizeState,

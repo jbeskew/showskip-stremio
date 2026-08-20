@@ -6,7 +6,7 @@ This is an Enhanced UI/player plugin, not a normal Stremio addon. It does not mo
 
 ## Project status
 
-Phase 0 established the completed research and architecture baseline. Phase 1 now provides the self-contained `ShowSkip.plugin.js`, its per-show configuration UI and storage foundation, focused tests, and safe local install/uninstall scripts.
+Phase 0 established the completed research and architecture baseline. Phase 1 now provides the self-contained `ShowSkip.plugin.js`, its per-show configuration UI and storage foundation, focused tests, and safe local install/uninstall scripts. Phase 1.1 gives the owned panel an explicit high-contrast palette after packaged Enhanced exposed unsafe host foreground variables.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for pinned-source findings, the data and lifecycle design, DOM validation, risks, unresolved questions, and the exact Phase 1–4 plan.
 
@@ -94,7 +94,7 @@ Then use the install script and manually verify the Phase 1 acceptance cases in 
 ### Packaged Enhanced manual checklist
 
 1. Run the installer, reload Enhanced with `Ctrl+R`, enable ShowSkip, and confirm it appears only once with no ShowSkip console error.
-2. Open a never-seen series. Confirm one launcher and an open panel with Recap/Intro/Credits/Preview set to **Button** and Next Episode set to **Stremio default**.
+2. Open a never-seen series. Confirm one launcher and an open panel whose five row labels—**Recap**, **Intro**, **Credits / Outro**, **Preview**, and **Next Episode**—are all clearly visible. Confirm every selected and unselected option is comfortably readable, with Recap/Intro/Credits/Preview set to **Button** and Next Episode set to **Stremio default**.
 3. Change one choice, close the panel, and confirm the entire panel disappears; only the launcher remains.
 4. Navigate home and back to the same series. Confirm one launcher, no panel, then click the launcher and confirm the saved choice returns.
 5. Open a different never-seen series. Confirm its panel opens with defaults and the first show's profile is unchanged.

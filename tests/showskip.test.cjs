@@ -42,10 +42,14 @@ function createLogger() {
 const hooks = loadHooks();
 const {
     LIMITS,
+    PANEL_PALETTE,
+    PANEL_ROWS,
     ProfileStore,
     CoalescedScheduler,
+    ShowPageController,
     canonicalShowKey,
     createDefaultProfile,
+    createStyles,
     ensureSingleOwnedNode,
     inspectJsonValue,
     normalizeState,
@@ -53,6 +57,223 @@ const {
     resolveActiveActionRow,
     selectReconcileProfile,
 } = hooks;
+
+const EXPECTED_PANEL_ROWS = Object.freeze([
+    { field: "recap", label: "Recap", values: ["auto", "button", "none"], labels: ["Auto", "Button", "Off"], selected: "button" },
+    { field: "intro", label: "Intro", values: ["auto", "button", "none"], labels: ["Auto", "Button", "Off"], selected: "button" },
+    { field: "credits", label: "Credits / Outro", values: ["auto", "button", "none"], labels: ["Auto", "Button", "Off"], selected: "button" },
+    { field: "preview", label: "Preview", values: ["auto", "button", "none"], labels: ["Auto", "Button", "Off"], selected: "button" },
+    {
+        field: "nextEpisode",
+        label: "Next Episode",
+        values: ["atCredits", "afterCredits", "button", "stremio", "never"],
+        labels: ["At credits", "After credits", "Button", "Stremio default", "Never"],
+        selected: "stremio",
+    },
+]);
+
+function createUiElement(tagName) {
+    return {
+        tagName: tagName.toUpperCase(),
+        attributes: Object.create(null),
+        children: [],
+        className: "",
+        textContent: "",
+        append(...nodes) {
+            this.children.push(...nodes);
+        },
+        appendChild(node) {
+            this.children.push(node);
+            return node;
+        },
+        setAttribute(name, value) {
+            this.attributes[name] = String(value);
+        },
+        getAttribute(name) {
+            return Object.prototype.hasOwnProperty.call(this.attributes, name)
+                ? this.attributes[name]
+                : null;
+        },
+        hasAttribute(name) {
+            return Object.prototype.hasOwnProperty.call(this.attributes, name);
+        },
+    };
+}
+
+function renderChoiceRows(profile) {
+    const documentObject = { createElement: createUiElement };
+    const controller = new ShowPageController({}, documentObject, {}, () => undefined);
+    controller.profile = profile;
+    return Array.from(PANEL_ROWS, (row) => controller._createChoiceRow(row, "fixture"));
+}
+
+function cssRuleBody(css, selector) {
+    const marker = `${selector} {`;
+    const start = css.indexOf(marker);
+    assert.notEqual(start, -1, `missing CSS rule: ${selector}`);
+    const bodyStart = start + marker.length;
+    const end = css.indexOf("}", bodyStart);
+    assert.notEqual(end, -1, `unterminated CSS rule: ${selector}`);
+    return css.slice(bodyStart, end);
+}
+
+function cssValue(body, property) {
+    const escaped = property.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const match = body.match(new RegExp(`(?:^|[;\\n])\\s*${escaped}\\s*:\\s*([^;]+);`, "u"));
+    assert.ok(match, `missing CSS property: ${property}`);
+    return match[1].trim();
+}
+
+function relativeLuminance(hex) {
+    const channels = hex.slice(1).match(/.{2}/gu).map((part) => Number.parseInt(part, 16) / 255);
+    const linear = channels.map((value) => (value <= 0.04045
+        ? value / 12.92
+        : ((value + 0.055) / 1.055) ** 2.4));
+    return (0.2126 * linear[0]) + (0.7152 * linear[1]) + (0.0722 * linear[2]);
+}
+
+function contrastRatio(first, second) {
+    const lighter = Math.max(relativeLuminance(first), relativeLuminance(second));
+    const darker = Math.min(relativeLuminance(first), relativeLuminance(second));
+    return (lighter + 0.05) / (darker + 0.05);
+}
+
+test("panel renders every required row and option label exactly once", () => {
+    assert.equal(PANEL_ROWS.length, 5);
+    assert.deepEqual(
+        plain(PANEL_ROWS).map(({ field, label, values, labels }) => ({ field, label, values, labels })),
+        EXPECTED_PANEL_ROWS.map(({ field, label, values, labels }) => ({ field, label, values, labels })),
+    );
+    assert.equal(new Set(Array.from(PANEL_ROWS, ({ field }) => field)).size, PANEL_ROWS.length);
+
+    const rendered = renderChoiceRows(createDefaultProfile("imdb:tt0903747"));
+    rendered.forEach((fieldset, rowIndex) => {
+        const spec = EXPECTED_PANEL_ROWS[rowIndex];
+        const [legend, group] = fieldset.children;
+        const inputs = group.children.filter((_node, index) => index % 2 === 0);
+        const labels = group.children.filter((_node, index) => index % 2 === 1);
+
+        assert.equal(fieldset.getAttribute("data-showskip-setting-row"), spec.field);
+        assert.equal(legend.textContent, spec.label);
+        assert.equal(legend.getAttribute("data-showskip-row-label"), spec.field);
+        assert.deepEqual(labels.map(({ textContent }) => textContent), spec.labels);
+        assert.equal(inputs.length, labels.length);
+        assert.deepEqual(inputs.map(({ value }) => value), spec.values);
+        assert.equal(new Set(inputs.map(({ value }) => value)).size, inputs.length);
+        inputs.forEach((input, optionIndex) => {
+            assert.equal(input.getAttribute("data-showskip-field"), spec.field);
+            assert.equal(labels[optionIndex].htmlFor, input.id);
+            assert.equal(labels[optionIndex].getAttribute("data-showskip-option-label"), input.value);
+        });
+        assert.deepEqual(inputs.filter(({ checked }) => checked).map(({ value }) => value), [spec.selected]);
+        assert.deepEqual(
+            labels.filter((_label, optionIndex) => inputs[optionIndex].checked).map(({ textContent }) => textContent),
+            [spec.labels[spec.values.indexOf(spec.selected)]],
+        );
+    });
+});
+
+test("panel choice rendering preserves non-default selected states", () => {
+    const profile = {
+        ...createDefaultProfile("imdb:tt0903747"),
+        recap: "auto",
+        intro: "none",
+        credits: "button",
+        preview: "auto",
+        nextEpisode: "never",
+    };
+    const expectedValues = ["auto", "none", "button", "auto", "never"];
+    const expectedLabels = ["Auto", "Off", "Button", "Auto", "Never"];
+    const rendered = renderChoiceRows(profile);
+
+    assert.deepEqual(rendered.map((fieldset) => {
+        const group = fieldset.children[1];
+        return group.children
+            .filter((_node, index) => index % 2 === 0 && group.children[index].checked)
+            .map(({ value }) => value)[0];
+    }), expectedValues);
+    assert.deepEqual(rendered.map((fieldset) => {
+        const group = fieldset.children[1];
+        const inputs = group.children.filter((_node, index) => index % 2 === 0);
+        const labels = group.children.filter((_node, index) => index % 2 === 1);
+        return labels.find((_label, index) => inputs[index].checked).textContent;
+    }), expectedLabels);
+});
+
+test("panel CSS owns readable foregrounds for every control state", () => {
+    const css = createStyles({ createElement: createUiElement }).textContent;
+    const panel = cssRuleBody(css, "[data-showskip-panel]");
+    const title = cssRuleBody(css, "[data-showskip-panel] .showskip-title");
+    const close = cssRuleBody(css, "[data-showskip-panel] .showskip-close");
+    const rowTitle = cssRuleBody(css, "[data-showskip-panel] .showskip-row-title");
+    const group = cssRuleBody(css, "[data-showskip-panel] .showskip-choice-group");
+    const option = cssRuleBody(css, "[data-showskip-panel] .showskip-choice-label");
+    const optionHover = cssRuleBody(css, "[data-showskip-panel] .showskip-choice-input:not(:checked):not(:disabled) + .showskip-choice-label:hover");
+    const selected = cssRuleBody(css, "[data-showskip-panel] .showskip-choice-input:checked + .showskip-choice-label");
+    const selectedHover = cssRuleBody(css, "[data-showskip-panel] .showskip-choice-input:checked:not(:disabled) + .showskip-choice-label:hover");
+    const disabled = cssRuleBody(css, "[data-showskip-panel] .showskip-choice-input:disabled + .showskip-choice-label");
+    const disabledSelected = cssRuleBody(css, "[data-showskip-panel] .showskip-choice-input:checked:disabled + .showskip-choice-label");
+    const choiceFocus = cssRuleBody(css, "[data-showskip-panel] .showskip-choice-input:focus-visible + .showskip-choice-label");
+    const closeFocus = cssRuleBody(css, "[data-showskip-panel] .showskip-close:focus-visible");
+
+    const emittedPalette = Object.create(null);
+    for (const [property, key] of [
+        ["--showskip-surface", "surface"],
+        ["--showskip-primary-text", "primaryText"],
+        ["--showskip-secondary-text", "secondaryText"],
+        ["--showskip-option-text", "optionText"],
+        ["--showskip-selected-text", "selectedText"],
+        ["--showskip-selected-surface", "selectedSurface"],
+        ["--showskip-disabled-text", "disabledText"],
+        ["--showskip-disabled-selected-surface", "disabledSelectedSurface"],
+        ["--showskip-control-surface", "controlSurface"],
+        ["--showskip-control-hover", "controlHover"],
+        ["--showskip-selected-hover", "selectedHover"],
+        ["--showskip-focus-ring", "focusRing"],
+    ]) {
+        emittedPalette[key] = cssValue(panel, property);
+        assert.equal(emittedPalette[key], PANEL_PALETTE[key]);
+    }
+
+    assert.equal(cssValue(panel, "background"), "var(--showskip-surface)");
+    assert.equal(cssValue(panel, "color"), "var(--showskip-primary-text)");
+    assert.equal(cssValue(title, "color"), "var(--showskip-primary-text)");
+    assert.equal(cssValue(close, "color"), "var(--showskip-primary-text)");
+    assert.equal(cssValue(rowTitle, "color"), "var(--showskip-secondary-text)");
+    assert.equal(cssValue(group, "background"), "var(--showskip-control-surface)");
+    assert.equal(cssValue(option, "color"), "var(--showskip-option-text)");
+    assert.equal(cssValue(optionHover, "background"), "var(--showskip-control-hover)");
+    assert.equal(cssValue(selected, "color"), "var(--showskip-selected-text)");
+    assert.equal(cssValue(selected, "background"), "var(--showskip-selected-surface)");
+    assert.equal(cssValue(selectedHover, "background"), "var(--showskip-selected-hover)");
+    assert.equal(cssValue(disabled, "color"), "var(--showskip-disabled-text)");
+    assert.equal(cssValue(disabledSelected, "background"), "var(--showskip-disabled-selected-surface)");
+    assert.equal(cssValue(choiceFocus, "outline"), "2px solid var(--showskip-primary-text)");
+    assert.equal(cssValue(choiceFocus, "outline-offset"), "-2px");
+    assert.equal(cssValue(closeFocus, "outline"), "2px solid var(--showskip-focus-ring)");
+
+    const criticalRules = [panel, title, close, rowTitle, option, selected, disabled].join("\n");
+    assert.doesNotMatch(criticalRules, /--(?:primary|secondary)-foreground-color/u);
+
+    for (const [foreground, background] of [
+        [emittedPalette.primaryText, emittedPalette.surface],
+        [emittedPalette.secondaryText, emittedPalette.surface],
+        [emittedPalette.optionText, emittedPalette.controlSurface],
+        [emittedPalette.optionText, emittedPalette.controlHover],
+        [emittedPalette.selectedText, emittedPalette.selectedSurface],
+        [emittedPalette.selectedText, emittedPalette.selectedHover],
+        [emittedPalette.disabledText, emittedPalette.controlSurface],
+        [emittedPalette.disabledText, emittedPalette.disabledSelectedSurface],
+        [emittedPalette.focusRing, emittedPalette.surface],
+        [emittedPalette.primaryText, emittedPalette.controlSurface],
+        [emittedPalette.primaryText, emittedPalette.selectedSurface],
+    ]) {
+        assert.ok(
+            contrastRatio(foreground, background) >= 4.5,
+            `${foreground} on ${background} must meet 4.5:1 contrast`,
+        );
+    }
+});
 
 test("route parsing accepts only active series detail shapes", () => {
     assert.deepEqual(plain(parseRoute("#/detail/series/tt0903747")), {

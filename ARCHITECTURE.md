@@ -1,6 +1,6 @@
 # ShowSkip Architecture
 
-Status: Phase 1 implementation complete; packaged Stremio Enhanced visual validation pending
+Status: Phase 1.1 contrast fix implemented; packaged load/render user-confirmed; corrected visual recheck pending
 Research date: 2026-08-20
 Target: Stremio Enhanced for Windows
 Artifact: one self-contained `ShowSkip.plugin.js`
@@ -57,14 +57,14 @@ Enhanced stores enabled filenames in Stremio Web `localStorage` under `enabledPl
 
 Enhanced parses the first `/** ... */` block in the file. Required keys are `name`, `description`, `author`, and `version`; optional allowlisted keys are `updateUrl`, `source`, `license`, `homepage`, and `requirements`. The parser and lists are authoritative in [`ExtractMetaData.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/utils/ExtractMetaData.ts#L15-L50) and [`MetaData.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/interfaces/MetaData.ts#L5-L45).
 
-Phase 1 should begin the file with this block, with no earlier JSDoc comment:
+The current artifact begins with this block, with no earlier JSDoc comment:
 
 ```javascript
 /**
  * @name ShowSkip
  * @description Per-show segment skipping and next-episode rules for Stremio Enhanced.
  * @updateUrl none
- * @version 0.1.0
+ * @version 0.1.1
  * @author ShowSkip contributors
  */
 ```
@@ -669,6 +669,7 @@ The following must be completed in installed Stremio Enhanced, not ordinary Stre
 | Fresh install, Settings card, enable, `Ctrl+R` | 1 | Exactly one plugin instance; config created safely |
 | Missing fields, corrupt/oversized state, migration, app restart | 1 | Bounded validation and per-field defaults; no crash or destructive overwrite; valid profiles/open state survive restart |
 | Series route with IMDb ID | 1 | Correct canonical key; launcher in native row; first panel opens |
+| Packaged panel contrast and labels | 1 | Recap, Intro, Credits / Outro, Preview, and Next Episode are distinct and readable; every selected/unselected option, title, and close control remains readable under the active Enhanced theme |
 | Non-IMDb series ID (for example Kitsu) | 1/2 | Namespaced profile works; provider declines unsupported ID rather than guessing |
 | Close on show A, revisit A, visit new show B | 1 | A stays closed; B opens; only launcher remains when closed |
 | Show → episode streams → show → different show | 1/2 | Hash-gated controller despite retained route DOM; no stale/duplicate UI; correct profile and teardown |
@@ -698,7 +699,7 @@ The following must be completed in installed Stremio Enhanced, not ordinary Stre
 1. **Enhanced runtime core bridge:** Which page-world shape is actually stable during Enhanced playback—direct `core.getState`, `services.core.getState`, or `services.core.transport.getState`—and what exact ready-state data is returned in 1.2.0?
 2. **Enhanced media path:** Pinned source implies built-in Enhanced playback selects HTMLVideo, but this must be confirmed with a real series stream through the configured local backend; unsupported YouTube/cast/external paths intentionally fail closed.
 3. **Enhanced runtime next control:** Does synthetic `Shift+N` invoke exactly one native transition in Enhanced, including core seek-history/library updates, and is an unambiguous native button available as fallback when controls are mounted?
-4. **Series DOM across layouts/themes:** The chosen append target is source- and public-DOM-backed, but it needs Enhanced validation with default and popular themes at desktop and narrow widths.
+4. **Series DOM across layouts/themes:** Basic insertion and rendering in packaged Enhanced are user-confirmed. The chosen append target still needs the full default/popular-theme and desktop/narrow-width matrix.
 5. **TMDB identity:** Current series routes commonly use IMDb IDs. Which reliable core/meta field, if any, exposes canonical TMDB IDs without another metadata service? Until verified, use IMDb and never reinterpret arbitrary numeric IDs.
 6. **Authored metadata:** Confirm final `@author`, public source URL, and project license before release. `@updateUrl` remains `none` unless the user explicitly changes the remote-code policy.
 7. **Distribution model:** TheIntroDB timestamp terms permit client-side non-commercial use. Any commercial or bundled paid distribution requires a separate agreement.
@@ -792,6 +793,6 @@ Concrete safety ceilings are 512 profiles, 512 KiB of serialized UTF-8 state, 51
 
 ### 14.3 Verification and remaining live gate
 
-The 23-test dependency-free Node suite covers route and key parsing, defaults, validation and migration, bounded traversal, inherited-value isolation, first-read retry, corrupt/over-limit recovery, serialized immutable writes, save failure, per-show independence, `panelOpen` ordering, stale-result protection, duplicate prevention, single-flight scheduler coalescing, and active-route DOM scoping. `node --check` and both PowerShell parser checks are part of the local workflow. The install/uninstall scripts were also exercised against an isolated temporary `APPDATA` tree, including hash-equal install, overwrite, settings preservation/reset, and unrelated-file preservation.
+The 26-test dependency-free Node suite covers exact panel rows/options/selections, owned contrast declarations and palette ratios, route and key parsing, defaults, validation and migration, bounded traversal, inherited-value isolation, first-read retry, corrupt/over-limit recovery, serialized immutable writes, save failure, per-show independence, `panelOpen` ordering, stale-result protection, duplicate prevention, single-flight scheduler coalescing, and active-route DOM scoping. `node --check` and both PowerShell parser checks are part of the local workflow. The install/uninstall scripts were also exercised against an isolated temporary `APPDATA` tree, including hash-equal install, overwrite, settings preservation/reset, and unrelated-file preservation.
 
-On 2026-08-20, read-only validation against the live public Stremio Web series detail page confirmed one focused router chain and the expected unique `action-buttons-container-*` target. The actual plugin artifact was then exercised in a local Chromium DOM harness using that router structure: first defaults, full collapse, reopen and choice persistence, independent IMDb/non-IMDb profiles, retained-route navigation cleanup, player/home cleanup, revisit, and action-row remount all passed without duplicates or plugin errors. The harness is not packaged Enhanced. The Codex environment could not drive the installed Stremio Enhanced Electron window, so the Phase 1 rows in section 10 remain a required packaged-Enhanced visual/manual gate: enable/reload, first visit, close/revisit/reopen, show independence, repeated SPA navigation, React remount, responsive layout, and disable cleanup. No packaged-Enhanced result is claimed here.
+On 2026-08-20, read-only validation against the live public Stremio Web series detail page confirmed one focused router chain and the expected unique `action-buttons-container-*` target. The actual plugin artifact was then exercised in a local Chromium DOM harness using that router structure: first defaults, full collapse, reopen and choice persistence, independent IMDb/non-IMDb profiles, retained-route navigation cleanup, player/home cleanup, revisit, and action-row remount all passed without duplicates or plugin errors. The user subsequently confirmed that Phase 1 loaded and rendered in the packaged Stremio Enhanced application; that run exposed unreadable row and unselected-option text caused by unsuitable host foreground variables. Phase 1.1 replaces critical panel colors with a scoped ShowSkip-owned palette and adds row/option and contrast assertions. The corrected artifact was verified in the Chromium harness, but still requires the user's packaged-Enhanced visual recheck for labels, all control states, alternate/narrow layouts, and the existing lifecycle cases. No claim of corrected packaged visual validation is made here.
