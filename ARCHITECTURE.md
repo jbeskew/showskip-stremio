@@ -1,15 +1,15 @@
 # ShowSkip Architecture
 
-Status: Phase 0 research and design only
+Status: Phase 1 implementation complete; packaged Stremio Enhanced visual validation pending
 Research date: 2026-08-20
 Target: Stremio Enhanced for Windows
-Planned artifact: one self-contained `ShowSkip.plugin.js`
+Artifact: one self-contained `ShowSkip.plugin.js`
 
 ## 1. Scope and non-goals
 
-ShowSkip is a Stremio Enhanced UI/player plugin, not a Stremio addon. It will add per-series playback rules for recap, intro, credits, preview, and next-episode behavior. The configuration surface belongs on each series detail page. Timeline regions remain visible whenever timestamps and the native seek bar are available, regardless of the selected skip behavior.
+ShowSkip is a Stremio Enhanced UI/player plugin, not a Stremio addon. Phase 1 provides per-series playback-rule configuration for recap, intro, credits, preview, and next-episode behavior; later phases will apply those rules. The configuration surface belongs on each series detail page. Timeline regions will remain visible whenever timestamps and the native seek bar are available, regardless of the selected skip behavior.
 
-Phase 0 contains no production plugin, UI, player mutation, or server component. The project will not modify Stremio Enhanced, Stremio Web, normal Stremio, Stremio Service, or `server.js`.
+Phase 0 contained no production plugin, UI, player mutation, or server component. Phase 1 adds only the standalone plugin foundation and per-show configuration UI described in section 14. The project does not modify Stremio Enhanced, Stremio Web, normal Stremio, Stremio Service, or `server.js`.
 
 ## 2. Research baseline
 
@@ -768,3 +768,30 @@ None of these blocks Phase 1's per-show profile UI. Questions 1–5 block or con
 - Playback defaults remain buttons, making timestamp errors recoverable.
 - Next episode uses only confirmed current state plus a live-validated host action, `Shift+N` shortcut, or unambiguous native control; it never guesses the next route.
 - Built-in Enhanced playback is expected to expose HTMLVideo, but the controller is capability-based and unsupported player implementations safely no-op.
+
+## 14. Phase 1 implementation record
+
+Phase 1 implements the planned per-show foundation in one self-contained `ShowSkip.plugin.js`. It deliberately contains no provider client, segment lookup, timeline marker, media observation, seek, skip, next-episode invocation, telemetry, remote script, or remote asset. The playback choices shown by the panel are configuration only.
+
+### 14.1 Implemented host and UI lifecycle
+
+- The verified metadata header uses `@updateUrl none`; boot replaces an older ShowSkip singleton and `destroy()` is idempotent.
+- Route parsing accepts only active `detail`/`metadetails` series hashes, decodes bounded identifiers defensively, prefers canonical IMDb keys, and uses an exact namespaced Stremio fallback for other series IDs.
+- DOM discovery follows the active router chain: the sole `.routes-container`, its last direct `.route-container`, its direct `.route-content`, then unique whole-token CSS-module prefixes for the series details, loaded preview, and direct action-button row. This is a source-backed refinement of Phase 0's route-and-structure-first strategy, not an architectural deviation.
+- A coalesced animation-frame reconciler handles SPA navigation and React remounts. Hash changes immediately invalidate stale async work and remove old-route presentation. A bounded late-mount retry replaces permanent polling.
+- Exactly one owned, accessible launcher is appended to the active series action row. The modeless body-portal panel uses native radio controls, desktop viewport clamping, a narrow bottom-sheet layout, and is physically removed when closed. Route teardown never changes the saved open state.
+- Teardown cancels owned frames and timeouts, disconnects document/loader/resize observers, removes all owned listeners and DOM/styles, and clears the singleton only when it still owns that slot.
+
+### 14.2 Implemented storage behavior
+
+Phase 1 stores one `state_v1` value through only the loader-scoped `getSetting` and `saveSetting` methods. The exact documented defaults and allowed values are enforced independently per canonical show key. The first read rejection is retried once; a second rejection, corrupt structure, unsupported version, cyclic/non-JSON value, or over-limit state enters a non-destructive memory-only mode and never overwrites the stored value.
+
+All read/modify/save operations share one promise queue and persist immutable snapshots, so rapid choices cannot race or overwrite one another. A failed save retains the latest choices in memory and disables further writes for that session. Phase 1 implements only the explicit schema-0-to-1 migration for the same field names; it does not guess aliases or coerce types. Unknown bounded JSON-safe fields are retained.
+
+Concrete safety ceilings are 512 profiles, 512 KiB of serialized UTF-8 state, 512 characters per canonical key, 32 own properties per profile, JSON depth 8, and 10,000 inspected nodes. Existing state and projected writes are checked before persistence.
+
+### 14.3 Verification and remaining live gate
+
+The 23-test dependency-free Node suite covers route and key parsing, defaults, validation and migration, bounded traversal, inherited-value isolation, first-read retry, corrupt/over-limit recovery, serialized immutable writes, save failure, per-show independence, `panelOpen` ordering, stale-result protection, duplicate prevention, single-flight scheduler coalescing, and active-route DOM scoping. `node --check` and both PowerShell parser checks are part of the local workflow. The install/uninstall scripts were also exercised against an isolated temporary `APPDATA` tree, including hash-equal install, overwrite, settings preservation/reset, and unrelated-file preservation.
+
+On 2026-08-20, read-only validation against the live public Stremio Web series detail page confirmed one focused router chain and the expected unique `action-buttons-container-*` target. The actual plugin artifact was then exercised in a local Chromium DOM harness using that router structure: first defaults, full collapse, reopen and choice persistence, independent IMDb/non-IMDb profiles, retained-route navigation cleanup, player/home cleanup, revisit, and action-row remount all passed without duplicates or plugin errors. The harness is not packaged Enhanced. The Codex environment could not drive the installed Stremio Enhanced Electron window, so the Phase 1 rows in section 10 remain a required packaged-Enhanced visual/manual gate: enable/reload, first visit, close/revisit/reopen, show independence, repeated SPA navigation, React remount, responsive layout, and disable cleanup. No packaged-Enhanced result is claimed here.
