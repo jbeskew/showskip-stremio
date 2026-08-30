@@ -2,7 +2,7 @@
  * @name ShowSkip
  * @description Per-show segment skipping and next-episode rules for Stremio Enhanced.
  * @updateUrl none
- * @version 0.1.1
+ * @version 0.2.0
  * @author ShowSkip contributors
  */
 
@@ -16,6 +16,8 @@
     const STATE_KEY = "state_v1";
     const SCHEMA_VERSION = 1;
     const PROFILE_VERSION = 1;
+    const THEINTRODB_ENDPOINT = "https://api.theintrodb.org/v3/media";
+    const THEINTRODB_ATTRIBUTION_URL = "https://theintrodb.com";
 
     const LIMITS = Object.freeze({
         maxProfiles: 512,
@@ -73,6 +75,25 @@
     const OWNED_SELECTOR = "[data-showskip-owned]";
     const LAUNCHER_SELECTOR = "[data-showskip-launcher]";
     const PANEL_SELECTOR = "[data-showskip-panel]";
+    const TIMELINE_LAYER_SELECTOR = "[data-showskip-timeline-layer]";
+    const PROVIDER_TYPES = Object.freeze(["recap", "intro", "credits", "preview"]);
+    const PROVIDER_LIMITS = Object.freeze({
+        maxTimestampMs: 21_600_000,
+        maxSegmentsPerType: 64,
+        maxResponseBytes: 256 * 1024,
+        cacheEntries: 24,
+        timeoutMs: 8_000,
+        retryDelayMs: 250,
+        maxRateRetryMs: 2_000,
+        durationQuietMs: 750,
+        maxDurationLookups: 2,
+    });
+    const SEGMENT_DURATION_LIMITS = Object.freeze({
+        intro: Object.freeze({ minimum: 5_000, maximum: 200_000 }),
+        recap: Object.freeze({ minimum: 5_000, maximum: 1_200_000 }),
+        credits: Object.freeze({ minimum: 5_000, maximum: 1_800_000 }),
+        preview: Object.freeze({ minimum: 5_000, maximum: 1_800_000 }),
+    });
 
     function isPlainObject(value) {
         if (value === null || typeof value !== "object" || Object.prototype.toString.call(value) !== "[object Object]") {
@@ -309,8 +330,27 @@
             && (/^imdb:tt[0-9]{7,}$/u.test(key) || /^stremio:series:.+/u.test(key));
     }
 
+    function isPositiveSafeInteger(value) {
+        return Number.isSafeInteger(value) && value > 0;
+    }
+
+    function parseEpisodeVideoId(metaId, videoId) {
+        if (!isSafeMetaId(metaId) || !isSafeMetaId(videoId)) {
+            return null;
+        }
+        const match = /:([1-9][0-9]*):([1-9][0-9]*)$/u.exec(videoId);
+        if (!match || videoId.slice(0, match.index) !== metaId) {
+            return null;
+        }
+        const season = Number(match[1]);
+        const episode = Number(match[2]);
+        return isPositiveSafeInteger(season) && isPositiveSafeInteger(episode)
+            ? { season, episode }
+            : null;
+    }
+
     function parseRoute(hash, limits = LIMITS) {
-        if (typeof hash !== "string") {
+        if (typeof hash !== "string" || hash.length > 16_384) {
             return { kind: "other" };
         }
 
@@ -328,6 +368,54 @@
         }
 
         const encodedParts = value.split("/");
+        if (encodedParts[0] === "player") {
+            if (encodedParts.length === 2 && encodedParts[1].length > 0) {
+                return {
+                    kind: "player",
+                    eligible: false,
+                    signature: JSON.stringify(["player", stableHash(value)]),
+                };
+            }
+            if (encodedParts.length !== 7
+                || encodedParts[1].length === 0
+                || encodedParts[4].length === 0
+                || encodedParts[5].length === 0
+                || encodedParts[6].length === 0) {
+                return { kind: "other" };
+            }
+
+            let type;
+            let metaId;
+            let videoId;
+            try {
+                type = decodeURIComponent(encodedParts[4]);
+                metaId = decodeURIComponent(encodedParts[5]);
+                videoId = decodeURIComponent(encodedParts[6]);
+            } catch (_error) {
+                return { kind: "other" };
+            }
+            if (type !== "series" || !isSafeMetaId(metaId, limits) || !isSafeMetaId(videoId, limits)) {
+                return {
+                    kind: "player",
+                    eligible: false,
+                    signature: JSON.stringify(["player", stableHash(value)]),
+                };
+            }
+            const episodeIdentity = parseEpisodeVideoId(metaId, videoId);
+            const showKey = canonicalShowKey(metaId, limits);
+            return {
+                kind: "player",
+                eligible: Boolean(episodeIdentity && showKey),
+                type,
+                metaId,
+                videoId,
+                showKey,
+                season: episodeIdentity ? episodeIdentity.season : null,
+                episode: episodeIdentity ? episodeIdentity.episode : null,
+                signature: JSON.stringify(["player", stableHash(value), type, metaId, videoId]),
+            };
+        }
+
         if (encodedParts.length < 3 || encodedParts.length > 4 || encodedParts.some((part) => part.length === 0)) {
             return { kind: "other" };
         }
@@ -867,6 +955,1583 @@
         return actionRows.length === 1 ? actionRows[0] : null;
     }
 
+    function resolveActiveRouteRoot(documentObject) {
+        if (!documentObject || typeof documentObject.querySelectorAll !== "function") {
+            return null;
+        }
+        const routers = Array.from(documentObject.querySelectorAll(".routes-container"));
+        if (routers.length !== 1) {
+            return null;
+        }
+        const routeContainers = directChildrenWithClass(routers[0], "route-container");
+        if (routeContainers.length === 0) {
+            return null;
+        }
+        const activeContainer = routeContainers[routeContainers.length - 1];
+        if (activeContainer.isConnected === false) {
+            return null;
+        }
+        const routeContents = directChildrenWithClass(activeContainer, "route-content");
+        return routeContents.length === 1 ? routeContents[0] : null;
+    }
+
+    function classifyCorePlayerState(state, route) {
+        if (!isPlainObject(state)) {
+            return { kind: "unavailable" };
+        }
+        const metaItem = ownValue(state, "metaItem");
+        if (!isPlainObject(metaItem)) {
+            return { kind: "unavailable" };
+        }
+        const loadableType = ownValue(metaItem, "type");
+        if (loadableType !== undefined && loadableType !== "Ready") {
+            return loadableType === "Loading" || loadableType === "NotRequested"
+                ? { kind: "unavailable" }
+                : { kind: "conflict" };
+        }
+        const content = isPlainObject(metaItem) ? ownValue(metaItem, "content") : undefined;
+        if (!isPlainObject(content)) {
+            return loadableType === "Ready" ? { kind: "conflict" } : { kind: "unavailable" };
+        }
+        if (ownValue(content, "type") !== "series" || ownValue(content, "id") !== route.metaId) {
+            return { kind: "conflict" };
+        }
+        const seriesInfo = ownValue(state, "seriesInfo");
+        if (!isPlainObject(seriesInfo)
+            || ownValue(seriesInfo, "season") !== route.season
+            || ownValue(seriesInfo, "episode") !== route.episode) {
+            return { kind: "conflict" };
+        }
+
+        const selected = ownValue(state, "selected");
+        if (selected !== undefined && selected !== null) {
+            if (!isPlainObject(selected)) {
+                return { kind: "conflict" };
+            }
+            for (const [field, expectedId] of [["metaRequest", route.metaId], ["streamRequest", route.videoId]]) {
+                const request = ownValue(selected, field);
+                if (request === undefined || request === null) {
+                    continue;
+                }
+                const path = isPlainObject(request) ? ownValue(request, "path") : undefined;
+                if (!isPlainObject(path)
+                    || ownValue(path, "type") !== "series"
+                    || ownValue(path, "id") !== expectedId) {
+                    return { kind: "conflict" };
+                }
+            }
+        }
+
+        const libraryItem = ownValue(state, "libraryItem");
+        if (libraryItem !== undefined && libraryItem !== null) {
+            const libraryState = isPlainObject(libraryItem) ? ownValue(libraryItem, "state") : undefined;
+            if (libraryState !== undefined && libraryState !== null) {
+                if (!isPlainObject(libraryState)) {
+                    return { kind: "conflict" };
+                }
+                const libraryVideoId = ownValue(libraryState, "video_id");
+                if (libraryVideoId !== undefined && libraryVideoId !== null && libraryVideoId !== route.videoId) {
+                    return { kind: "conflict" };
+                }
+            }
+        }
+        return { kind: "match" };
+    }
+
+    function createEpisodeIdentity(route, coreStates = []) {
+        if (!route || route.kind !== "player" || route.eligible !== true
+            || !isPositiveSafeInteger(route.season) || !isPositiveSafeInteger(route.episode)) {
+            return null;
+        }
+        let matchedCore = false;
+        let conflictingCore = false;
+        for (const state of coreStates) {
+            const classification = classifyCorePlayerState(state, route);
+            matchedCore = matchedCore || classification.kind === "match";
+            conflictingCore = conflictingCore || classification.kind === "conflict";
+        }
+        if (conflictingCore) {
+            return null;
+        }
+
+        const imdbId = /^tt[0-9]{7,8}$/iu.test(route.metaId) ? route.metaId.toLowerCase() : null;
+        const episodeKey = `${route.showKey}|s${route.season}|e${route.episode}|${encodeURIComponent(route.videoId)}`;
+        return Object.freeze({
+            showKey: route.showKey,
+            canonicalSeriesId: route.metaId,
+            stremioSeriesId: route.metaId,
+            stremioVideoId: route.videoId,
+            episodeKey,
+            season: route.season,
+            episode: route.episode,
+            imdbId,
+            tmdbId: null,
+            tvdbId: null,
+            providerMediaId: imdbId ? Object.freeze({ scheme: "imdb", value: imdbId }) : null,
+            activeRoute: Object.freeze({
+                kind: "player",
+                type: route.type,
+                metaId: route.metaId,
+                videoId: route.videoId,
+                signature: route.signature,
+            }),
+            identitySource: matchedCore ? "route+core" : "route",
+        });
+    }
+
+    function abortError() {
+        const error = new Error("Operation aborted");
+        error.name = "AbortError";
+        return error;
+    }
+
+    function waitWithSignal(setTimeoutFn, clearTimeoutFn, delayMs, signal) {
+        if (signal && signal.aborted) {
+            return Promise.reject(abortError());
+        }
+        return new Promise((resolve, reject) => {
+            const handle = setTimeoutFn(() => {
+                if (signal) {
+                    signal.removeEventListener("abort", onAbort);
+                }
+                resolve();
+            }, delayMs);
+            const onAbort = () => {
+                clearTimeoutFn(handle);
+                signal.removeEventListener("abort", onAbort);
+                reject(abortError());
+            };
+            if (signal) {
+                signal.addEventListener("abort", onAbort, { once: true });
+            }
+        });
+    }
+
+    class CoreStateReader {
+        constructor(windowObject, options = {}) {
+            this.window = windowObject;
+            this.setTimeout = options.setTimeout || windowObject.setTimeout.bind(windowObject);
+            this.clearTimeout = options.clearTimeout || windowObject.clearTimeout.bind(windowObject);
+            this.timeoutMs = options.timeoutMs || 800;
+            this.readers = [];
+            this.activeReaders = [];
+            this.refresh();
+        }
+
+        refresh() {
+            const candidates = [];
+            try {
+                candidates.push(this.window.core);
+            } catch (_error) {
+                // A page-world getter may throw; that candidate is simply unavailable.
+            }
+            try {
+                candidates.push(this.window.services && this.window.services.core);
+                candidates.push(this.window.services && this.window.services.core
+                    && this.window.services.core.transport);
+            } catch (_error) {
+                // Keep previously captured bound readers.
+            }
+            const activeReaders = [];
+            for (const owner of candidates) {
+                let method;
+                try {
+                    method = owner && owner.getState;
+                } catch (_error) {
+                    method = null;
+                }
+                if (!owner || typeof method !== "function") {
+                    continue;
+                }
+                let entry = this.readers.find((candidate) => candidate.owner === owner && candidate.method === method);
+                if (!entry) {
+                    entry = { owner, method, read: method.bind(owner) };
+                    this.readers.unshift(entry);
+                }
+                if (!activeReaders.includes(entry)) {
+                    activeReaders.push(entry);
+                }
+            }
+            this.readers = this.readers.slice(0, 6);
+            this.activeReaders = activeReaders;
+        }
+
+        async read(signal) {
+            this.refresh();
+            const selectedReaders = this.activeReaders.length > 0 ? this.activeReaders : this.readers;
+            const results = await Promise.all(selectedReaders.map(async (entry) => {
+                try {
+                    const value = await new Promise((resolve, reject) => {
+                        let settled = false;
+                        let timeout = null;
+                        const finish = (callback, result) => {
+                            if (settled) {
+                                return;
+                            }
+                            settled = true;
+                            if (timeout !== null) {
+                                this.clearTimeout(timeout);
+                            }
+                            if (signal) {
+                                signal.removeEventListener("abort", onAbort);
+                            }
+                            callback(result);
+                        };
+                        const onAbort = () => finish(reject, abortError());
+                        timeout = this.setTimeout(
+                            () => finish(reject, new Error("Core state read timed out")),
+                            this.timeoutMs,
+                        );
+                        if (signal) {
+                            if (signal.aborted) {
+                                onAbort();
+                                return;
+                            }
+                            signal.addEventListener("abort", onAbort, { once: true });
+                        }
+                        Promise.resolve().then(() => entry.read("player")).then(
+                            (result) => finish(resolve, result),
+                            (error) => finish(reject, error),
+                        );
+                    });
+                    return { ok: true, value };
+                } catch (_error) {
+                    return { ok: false };
+                }
+            }));
+            if (signal && signal.aborted) {
+                throw abortError();
+            }
+            return results.filter((result) => result.ok).map((result) => result.value);
+        }
+    }
+
+    class EpisodeIdentityProvider {
+        constructor(contextDetector, coreStateReader) {
+            this.contextDetector = contextDetector;
+            this.coreStateReader = coreStateReader;
+        }
+
+        async resolve(route, signal) {
+            if (!route || route.kind !== "player" || route.eligible !== true) {
+                return null;
+            }
+            const states = await this.coreStateReader.read(signal);
+            if (signal && signal.aborted) {
+                throw abortError();
+            }
+            const current = this.contextDetector.current();
+            if (current.kind !== "player" || current.signature !== route.signature) {
+                return null;
+            }
+            return createEpisodeIdentity(route, states);
+        }
+    }
+
+    function isVisiblyActiveElement(element, windowObject) {
+        if (!element || element.isConnected === false) {
+            return false;
+        }
+        if (typeof element.getBoundingClientRect === "function") {
+            const rect = element.getBoundingClientRect();
+            if (!rect || !(rect.width > 0) || !(rect.height > 0)) {
+                return false;
+            }
+        }
+        if (windowObject && typeof windowObject.getComputedStyle === "function") {
+            const style = windowObject.getComputedStyle(element);
+            if (style && (style.display === "none" || style.visibility === "hidden")) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    function resolveActiveHtmlVideo(documentObject, windowObject) {
+        const routeRoot = resolveActiveRouteRoot(documentObject);
+        if (!routeRoot) {
+            return null;
+        }
+        const players = descendantsWithModuleClass(routeRoot, "player-container");
+        if (players.length !== 1 || !isVisiblyActiveElement(players[0], windowObject)) {
+            return null;
+        }
+        const videoContainers = descendantsWithModuleClass(players[0], "video-container");
+        if (videoContainers.length !== 1 || !isVisiblyActiveElement(videoContainers[0], windowObject)) {
+            return null;
+        }
+        const videos = typeof videoContainers[0].querySelectorAll === "function"
+            ? Array.from(videoContainers[0].querySelectorAll("video"))
+                .filter((video) => isVisiblyActiveElement(video, windowObject))
+            : [];
+        return videos.length === 1 ? videos[0] : null;
+    }
+
+    function normalizeDurationMs(durationSeconds) {
+        if (typeof durationSeconds !== "number" || !Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+            return null;
+        }
+        const durationMs = Math.round(durationSeconds * 1000);
+        return isPositiveSafeInteger(durationMs) ? durationMs : null;
+    }
+
+    class HtmlMediaAdapter {
+        constructor(windowObject, videoElement) {
+            this.window = windowObject;
+            this.video = videoElement;
+            this.listeners = new Set();
+            this.eventListeners = [];
+            this.destroyed = false;
+            this.capabilities = Object.freeze({
+                canObserveTime: true,
+                canObserveDuration: true,
+                canSeek: false,
+            });
+            for (const type of [
+                "loadedmetadata",
+                "durationchange",
+                "loadstart",
+                "emptied",
+                "timeupdate",
+                "seeking",
+                "seeked",
+                "play",
+                "ended",
+            ]) {
+                const handler = () => this._emit(type);
+                videoElement.addEventListener(type, handler);
+                this.eventListeners.push({ type, handler });
+            }
+        }
+
+        getSnapshot() {
+            if (this.destroyed || !this.video || this.video.isConnected === false) {
+                return Object.freeze({ connected: false, currentTimeMs: null, durationMs: null, readyState: 0, source: "" });
+            }
+            let currentTime;
+            let duration;
+            let readyState;
+            let source;
+            try {
+                currentTime = this.video.currentTime;
+                duration = this.video.duration;
+                readyState = this.video.readyState;
+                source = this.video.currentSrc || this.video.src || "";
+            } catch (_error) {
+                return Object.freeze({ connected: false, currentTimeMs: null, durationMs: null, readyState: 0, source: "" });
+            }
+            const currentTimeMs = typeof currentTime === "number" && Number.isFinite(currentTime) && currentTime >= 0
+                ? Math.round(currentTime * 1000)
+                : null;
+            return Object.freeze({
+                connected: true,
+                currentTimeMs,
+                durationMs: normalizeDurationMs(duration),
+                readyState: Number.isFinite(readyState) ? readyState : 0,
+                source: typeof source === "string" ? source : "",
+            });
+        }
+
+        subscribe(listener) {
+            if (typeof listener !== "function" || this.destroyed) {
+                return () => undefined;
+            }
+            this.listeners.add(listener);
+            return () => this.listeners.delete(listener);
+        }
+
+        destroy() {
+            if (this.destroyed) {
+                return;
+            }
+            this.destroyed = true;
+            for (const { type, handler } of this.eventListeners) {
+                this.video.removeEventListener(type, handler);
+            }
+            this.eventListeners = [];
+            this.listeners.clear();
+        }
+
+        _emit(type) {
+            const snapshot = this.getSnapshot();
+            for (const listener of this.listeners) {
+                try {
+                    listener({ type, snapshot });
+                } catch (_error) {
+                    // One observer must not break media observation for the plugin.
+                }
+            }
+        }
+    }
+
+    class DurationStabilizer {
+        constructor(options) {
+            this.setTimeout = options.setTimeout;
+            this.clearTimeout = options.clearTimeout;
+            this.quietMs = options.quietMs || PROVIDER_LIMITS.durationQuietMs;
+            this.maxDistinct = options.maxDistinct || PROVIDER_LIMITS.maxDurationLookups;
+            this.onStable = options.onStable;
+            this.onLimit = options.onLimit || (() => undefined);
+            this.scopeKey = null;
+            this.candidate = null;
+            this.timer = null;
+            this.issued = new Set();
+        }
+
+        update(scopeKey, durationMs) {
+            if (scopeKey !== this.scopeKey) {
+                this.reset(scopeKey);
+            }
+            if (!isPositiveSafeInteger(durationMs)) {
+                this._clearTimer();
+                this.candidate = null;
+                return;
+            }
+            if (this.issued.has(durationMs)) {
+                this._clearTimer();
+                this.candidate = durationMs;
+                return;
+            }
+            if (this.candidate === durationMs && this.timer !== null) {
+                return;
+            }
+            this._clearTimer();
+            this.candidate = durationMs;
+            this.timer = this.setTimeout(() => {
+                this.timer = null;
+                if (this.candidate !== durationMs || this.scopeKey !== scopeKey) {
+                    return;
+                }
+                if (this.issued.size >= this.maxDistinct) {
+                    this.onLimit({ scopeKey, durationMs });
+                    return;
+                }
+                this.issued.add(durationMs);
+                this.onStable({ scopeKey, durationMs });
+            }, this.quietMs);
+        }
+
+        reset(scopeKey = null) {
+            this._clearTimer();
+            this.scopeKey = scopeKey;
+            this.candidate = null;
+            this.issued = new Set();
+        }
+
+        destroy() {
+            this.reset(null);
+        }
+
+        _clearTimer() {
+            if (this.timer !== null) {
+                this.clearTimeout(this.timer);
+                this.timer = null;
+            }
+        }
+    }
+
+    class SessionSegmentCache {
+        constructor(maxEntries = PROVIDER_LIMITS.cacheEntries) {
+            this.maxEntries = maxEntries;
+            this.entries = new Map();
+        }
+
+        get(key) {
+            if (!this.entries.has(key)) {
+                return null;
+            }
+            const value = this.entries.get(key);
+            this.entries.delete(key);
+            this.entries.set(key, value);
+            return value;
+        }
+
+        set(key, value) {
+            this.entries.delete(key);
+            this.entries.set(key, value);
+            while (this.entries.size > this.maxEntries) {
+                const oldest = this.entries.keys().next().value;
+                this.entries.delete(oldest);
+            }
+        }
+
+        clear() {
+            this.entries.clear();
+        }
+    }
+
+    function providerCacheKey(identity, durationMs) {
+        if (!identity || typeof identity.episodeKey !== "string" || !isPositiveSafeInteger(durationMs)) {
+            return null;
+        }
+        return `theintrodb|anonymous|${identity.episodeKey}|duration=${durationMs}`;
+    }
+
+    function buildTheIntroDbUrl(identity, durationMs) {
+        if (!identity || !isPositiveSafeInteger(identity.season)
+            || !isPositiveSafeInteger(identity.episode) || !isPositiveSafeInteger(durationMs)) {
+            return null;
+        }
+        const mediaId = identity.providerMediaId;
+        let idQuery;
+        if (mediaId && mediaId.scheme === "imdb" && /^tt[0-9]{7,8}$/u.test(mediaId.value)) {
+            idQuery = `imdb_id=${encodeURIComponent(mediaId.value)}`;
+        } else if (mediaId && mediaId.scheme === "tmdb"
+            && isPositiveSafeInteger(mediaId.value) && mediaId.value <= 10_000_000) {
+            idQuery = `tmdb_id=${mediaId.value}`;
+        } else if (mediaId && mediaId.scheme === "tvdb"
+            && isPositiveSafeInteger(mediaId.value) && mediaId.value <= 10_000_000) {
+            idQuery = `tvdb_id=${mediaId.value}`;
+        } else {
+            return null;
+        }
+        return `${THEINTRODB_ENDPOINT}?${idQuery}&season=${identity.season}&episode=${identity.episode}&duration_ms=${durationMs}`;
+    }
+
+    function isProviderTimestamp(value) {
+        return value === null
+            || (Number.isSafeInteger(value) && value >= 0 && value <= PROVIDER_LIMITS.maxTimestampMs);
+    }
+
+    function classifyProviderSegment(type, rawSegment, actualDurationMs) {
+        if (!PROVIDER_TYPES.includes(type) || !isPlainObject(rawSegment)
+            || !hasOwn(rawSegment, "start_ms") || !hasOwn(rawSegment, "end_ms")) {
+            return { kind: "malformed" };
+        }
+        const rawStart = rawSegment.start_ms;
+        const rawEnd = rawSegment.end_ms;
+        if (!isProviderTimestamp(rawStart) || !isProviderTimestamp(rawEnd)) {
+            return { kind: "malformed" };
+        }
+
+        let startMs;
+        let endMs;
+        let endsAtMediaEnd = false;
+        if (type === "intro" || type === "recap") {
+            if (rawEnd === null) {
+                return { kind: "malformed" };
+            }
+            if (rawEnd === 0) {
+                return { kind: "sentinel" };
+            }
+            startMs = rawStart === null ? 0 : rawStart;
+            endMs = rawEnd;
+            if (endMs <= startMs) {
+                return { kind: "unusable" };
+            }
+        } else {
+            if (rawStart === null) {
+                return { kind: "malformed" };
+            }
+            if (rawStart === 0 || rawEnd === 0) {
+                return { kind: "sentinel" };
+            }
+            startMs = rawStart;
+            if (rawEnd === null) {
+                endMs = actualDurationMs;
+                endsAtMediaEnd = true;
+            } else {
+                endMs = rawEnd;
+                if (endMs <= startMs) {
+                    return { kind: "unusable" };
+                }
+            }
+        }
+
+        if (!isPositiveSafeInteger(actualDurationMs)
+            || startMs < 0 || startMs >= actualDurationMs
+            || !isPositiveSafeInteger(endMs) || endMs > actualDurationMs || endMs <= startMs) {
+            return { kind: "unusable" };
+        }
+        if (!endsAtMediaEnd) {
+            const duration = endMs - startMs;
+            const limits = SEGMENT_DURATION_LIMITS[type];
+            if (duration < limits.minimum || duration > limits.maximum) {
+                return { kind: "unusable" };
+            }
+        }
+
+        return {
+            kind: "segment",
+            segment: Object.freeze({
+                id: `${type}:${startMs}:${endsAtMediaEnd ? "media-end" : endMs}`,
+                type,
+                startMs,
+                endMs,
+                endsAtMediaEnd,
+                provider: "theintrodb",
+                providerSource: "v3/media",
+                status: "accepted",
+                confidence: null,
+            }),
+        };
+    }
+
+    function normalizeProviderSegment(type, rawSegment, actualDurationMs) {
+        const result = classifyProviderSegment(type, rawSegment, actualDurationMs);
+        return result.kind === "segment" ? result.segment : null;
+    }
+
+    function validateTheIntroDbResponse(body, identity, actualDurationMs) {
+        if (!isPlainObject(body)
+            || ownValue(body, "type") !== "tv"
+            || !isPositiveSafeInteger(ownValue(body, "tmdb_id"))
+            || ownValue(body, "tmdb_id") > 10_000_000
+            || !isPositiveSafeInteger(actualDurationMs)) {
+            return { ok: false, reason: "malformed" };
+        }
+        if (identity.providerMediaId && identity.providerMediaId.scheme === "tmdb"
+            && ownValue(body, "tmdb_id") !== identity.providerMediaId.value) {
+            return { ok: false, reason: "identity-mismatch" };
+        }
+        for (const [field, expected] of [["season", identity.season], ["episode", identity.episode]]) {
+            const value = ownValue(body, field);
+            if (value !== undefined && value !== null && value !== expected) {
+                return { ok: false, reason: "identity-mismatch" };
+            }
+        }
+
+        const segments = [];
+        const seen = new Set();
+        for (const type of PROVIDER_TYPES) {
+            const collection = ownValue(body, type);
+            if (collection === undefined) {
+                continue;
+            }
+            if (!Array.isArray(collection) || collection.length > PROVIDER_LIMITS.maxSegmentsPerType) {
+                return { ok: false, reason: "malformed" };
+            }
+            for (const rawSegment of collection) {
+                const normalized = classifyProviderSegment(type, rawSegment, actualDurationMs);
+                if (normalized.kind === "malformed") {
+                    return { ok: false, reason: "malformed" };
+                }
+                if (normalized.kind !== "segment") {
+                    continue;
+                }
+                const segment = normalized.segment;
+                const key = `${segment.type}|${segment.startMs}|${segment.endMs}|${segment.endsAtMediaEnd}`;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    segments.push(segment);
+                }
+            }
+        }
+        segments.sort((first, second) => first.startMs - second.startMs
+            || first.endMs - second.endMs || first.type.localeCompare(second.type));
+        return {
+            ok: true,
+            tmdbId: body.tmdb_id,
+            segments: Object.freeze(segments),
+        };
+    }
+
+    function responseHeader(response, name) {
+        try {
+            return response && response.headers && typeof response.headers.get === "function"
+                ? response.headers.get(name)
+                : null;
+        } catch (_error) {
+            return null;
+        }
+    }
+
+    function subscribeToInFlight(entry, signal) {
+        if (signal && signal.aborted) {
+            return Promise.reject(abortError());
+        }
+        entry.consumers += 1;
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (callback, value) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                if (signal) {
+                    signal.removeEventListener("abort", onAbort);
+                }
+                entry.consumers = Math.max(0, entry.consumers - 1);
+                callback(value);
+            };
+            const onAbort = () => {
+                finish(reject, abortError());
+                if (!entry.settled && entry.consumers === 0) {
+                    entry.controller.abort();
+                }
+            };
+            if (signal) {
+                signal.addEventListener("abort", onAbort, { once: true });
+            }
+            entry.promise.then(
+                (value) => finish(resolve, value),
+                (error) => finish(reject, error),
+            );
+        });
+    }
+
+    class TheIntroDBProvider {
+        constructor(options = {}) {
+            this.fetch = options.fetch;
+            this.setTimeout = options.setTimeout || setTimeout;
+            this.clearTimeout = options.clearTimeout || clearTimeout;
+            this.AbortController = hasOwn(options, "AbortController")
+                ? options.AbortController
+                : globalThis.AbortController;
+            this.now = options.now || Date.now;
+            this.timeoutMs = options.timeoutMs || PROVIDER_LIMITS.timeoutMs;
+            this.retryDelayMs = options.retryDelayMs || PROVIDER_LIMITS.retryDelayMs;
+            this.maxRateRetryMs = options.maxRateRetryMs || PROVIDER_LIMITS.maxRateRetryMs;
+            this.cache = options.cache || new SessionSegmentCache();
+            this.inFlight = new Map();
+            this.controllers = new Set();
+            this.dailyExhausted = false;
+            this.destroyed = false;
+        }
+
+        async fetchEpisode(identity, durationMs, signal) {
+            const url = buildTheIntroDbUrl(identity, durationMs);
+            const key = providerCacheKey(identity, durationMs);
+            if (!url || !key || typeof this.fetch !== "function" || this.destroyed) {
+                return Object.freeze({ kind: "unavailable", reason: "unsupported" });
+            }
+            if (typeof this.AbortController !== "function") {
+                return Object.freeze({ kind: "unavailable", reason: "abort-unsupported" });
+            }
+            if (signal && signal.aborted) {
+                throw abortError();
+            }
+            const cached = this.cache.get(key);
+            if (cached) {
+                return cached;
+            }
+            if (this.dailyExhausted) {
+                return Object.freeze({ kind: "unavailable", reason: "daily-limit" });
+            }
+            const existing = this.inFlight.get(key);
+            if (existing && !existing.controller.signal.aborted) {
+                return subscribeToInFlight(existing, signal);
+            }
+            if (existing && this.inFlight.get(key) === existing) {
+                this.inFlight.delete(key);
+            }
+
+            const entry = {
+                controller: new this.AbortController(),
+                consumers: 0,
+                settled: false,
+                promise: null,
+            };
+            entry.promise = this._perform(url, key, identity, durationMs, entry.controller.signal)
+                .finally(() => {
+                    entry.settled = true;
+                    if (this.inFlight.get(key) === entry) {
+                        this.inFlight.delete(key);
+                    }
+                });
+            this.inFlight.set(key, entry);
+            return subscribeToInFlight(entry, signal);
+        }
+
+        destroy() {
+            if (this.destroyed) {
+                return;
+            }
+            this.destroyed = true;
+            for (const entry of this.inFlight.values()) {
+                entry.controller.abort();
+            }
+            for (const controller of this.controllers) {
+                controller.abort();
+            }
+            this.controllers.clear();
+            this.inFlight.clear();
+            this.cache.clear();
+        }
+
+        async _perform(url, key, identity, durationMs, signal) {
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+                if (this.destroyed || (signal && signal.aborted)) {
+                    throw abortError();
+                }
+                const outcome = await this._attempt(url, identity, durationMs, signal);
+                if (outcome.kind === "cacheable") {
+                    if (this.destroyed || (signal && signal.aborted)) {
+                        throw abortError();
+                    }
+                    this.cache.set(key, outcome.result);
+                    return outcome.result;
+                }
+                if (outcome.kind === "daily-limit") {
+                    this.dailyExhausted = true;
+                    return Object.freeze({ kind: "unavailable", reason: "daily-limit" });
+                }
+                if (outcome.kind === "aborted") {
+                    throw abortError();
+                }
+                if (outcome.kind !== "retry" || attempt > 0) {
+                    return Object.freeze({ kind: "unavailable", reason: outcome.reason || "request-failed" });
+                }
+                await waitWithSignal(this.setTimeout, this.clearTimeout, outcome.delayMs, signal);
+            }
+            return Object.freeze({ kind: "unavailable", reason: "request-failed" });
+        }
+
+        async _attempt(url, identity, durationMs, signal) {
+            if (typeof this.AbortController !== "function") {
+                return { kind: "stop", reason: "abort-unsupported" };
+            }
+            const controller = new this.AbortController();
+            this.controllers.add(controller);
+            let timedOut = false;
+            let rejectLifetime;
+            const lifetime = new Promise((_resolve, reject) => {
+                rejectLifetime = reject;
+            });
+            const onAbort = () => {
+                controller.abort();
+                rejectLifetime(abortError());
+            };
+            signal.addEventListener("abort", onAbort, { once: true });
+            const timeout = this.setTimeout(() => {
+                timedOut = true;
+                controller.abort();
+                rejectLifetime(new Error("Provider request timed out"));
+            }, this.timeoutMs);
+            try {
+                const work = Promise.resolve().then(async () => {
+                    const response = await this.fetch(url, {
+                        method: "GET",
+                        headers: { Accept: "application/json" },
+                        credentials: "omit",
+                        cache: "no-store",
+                        redirect: "error",
+                        referrerPolicy: "no-referrer",
+                        signal: controller.signal,
+                    });
+                    return this._processResponse(response, identity, durationMs);
+                });
+                return await Promise.race([work, lifetime]);
+            } catch (_error) {
+                if (signal.aborted || this.destroyed) {
+                    return { kind: "aborted" };
+                }
+                return { kind: "retry", reason: timedOut ? "timeout" : "network", delayMs: this.retryDelayMs };
+            } finally {
+                this.clearTimeout(timeout);
+                signal.removeEventListener("abort", onAbort);
+                this.controllers.delete(controller);
+            }
+        }
+
+        async _processResponse(response, identity, durationMs) {
+            if (response.status === 404 || response.status === 204) {
+                return {
+                    kind: "cacheable",
+                    result: Object.freeze({ kind: "empty", reason: response.status === 404 ? "not-found" : "legacy-no-content" }),
+                };
+            }
+            if (response.status === 429) {
+                const usageRemaining = responseHeader(response, "X-UsageLimit-Remaining");
+                if (typeof usageRemaining === "string" && usageRemaining.trim() === "0") {
+                    return { kind: "daily-limit" };
+                }
+                let body = null;
+                try {
+                    body = await this._readJson(response);
+                } catch (_error) {
+                    body = null;
+                }
+                if (isPlainObject(body) && ownValue(body, "code") === "usage_limit_exceeded") {
+                    return { kind: "daily-limit" };
+                }
+                const reset = responseHeader(response, "X-RateLimit-Reset");
+                if (typeof reset === "string" && /^[0-9]+$/u.test(reset.trim())) {
+                    const delayMs = Number(reset.trim()) * 1000;
+                    if (Number.isSafeInteger(delayMs) && delayMs >= 0 && delayMs <= this.maxRateRetryMs) {
+                        return { kind: "retry", reason: "rate-limit", delayMs };
+                    }
+                }
+                return { kind: "stop", reason: "rate-limit" };
+            }
+            if (response.status >= 500 && response.status <= 599) {
+                return { kind: "retry", reason: "server", delayMs: this.retryDelayMs };
+            }
+            if (response.status !== 200) {
+                return { kind: "stop", reason: `http-${response.status}` };
+            }
+
+            let body;
+            try {
+                body = await this._readJson(response);
+            } catch (_error) {
+                return { kind: "stop", reason: "malformed" };
+            }
+            const validated = validateTheIntroDbResponse(body, identity, durationMs);
+            if (!validated.ok) {
+                return { kind: "stop", reason: validated.reason };
+            }
+            if (validated.segments.length === 0) {
+                return {
+                    kind: "cacheable",
+                    result: Object.freeze({ kind: "empty", reason: "no-valid-segments" }),
+                };
+            }
+            const bundle = Object.freeze({
+                provider: "theintrodb",
+                providerVersion: "v3",
+                media: Object.freeze({
+                    episodeKey: identity.episodeKey,
+                    showKey: identity.showKey,
+                    imdbId: identity.imdbId,
+                    tmdbId: validated.tmdbId,
+                    season: identity.season,
+                    episode: identity.episode,
+                }),
+                request: Object.freeze({ durationMs, authMode: "anonymous" }),
+                fetchedAt: this.now(),
+                segments: validated.segments,
+            });
+            return { kind: "cacheable", result: Object.freeze({ kind: "segments", bundle }) };
+        }
+
+        async _readJson(response) {
+            const declared = responseHeader(response, "Content-Length");
+            if (typeof declared === "string" && /^[0-9]+$/u.test(declared.trim())
+                && Number(declared.trim()) > PROVIDER_LIMITS.maxResponseBytes) {
+                throw new Error("Provider response is too large");
+            }
+
+            let body;
+            if (response.body && typeof response.body.getReader === "function") {
+                const reader = response.body.getReader();
+                const chunks = [];
+                let total = 0;
+                try {
+                    while (true) {
+                        const part = await reader.read();
+                        if (part.done) {
+                            break;
+                        }
+                        if (!(part.value instanceof Uint8Array)) {
+                            throw new Error("Malformed provider body stream");
+                        }
+                        total += part.value.byteLength;
+                        if (total > PROVIDER_LIMITS.maxResponseBytes) {
+                            await reader.cancel();
+                            throw new Error("Provider response is too large");
+                        }
+                        chunks.push(part.value);
+                    }
+                } finally {
+                    if (typeof reader.releaseLock === "function") {
+                        reader.releaseLock();
+                    }
+                }
+                const bytes = new Uint8Array(total);
+                let offset = 0;
+                for (const chunk of chunks) {
+                    bytes.set(chunk, offset);
+                    offset += chunk.byteLength;
+                }
+                body = JSON.parse(new TextDecoder().decode(bytes));
+            } else if (typeof response.text === "function") {
+                const text = await response.text();
+                const bytes = typeof TextEncoder === "function" ? new TextEncoder().encode(text).byteLength : text.length * 2;
+                if (bytes > PROVIDER_LIMITS.maxResponseBytes) {
+                    throw new Error("Provider response is too large");
+                }
+                body = JSON.parse(text);
+            } else {
+                body = await response.json();
+            }
+            if (serializedByteLength(body) > PROVIDER_LIMITS.maxResponseBytes) {
+                throw new Error("Provider response is too large");
+            }
+            return body;
+        }
+    }
+
+    function hasOwnedMarker(node) {
+        return Boolean(node && typeof node.hasAttribute === "function" && node.hasAttribute("data-showskip-owned"));
+    }
+
+    function descendantsWithExactModuleKind(element, kind) {
+        if (!element || typeof element.querySelectorAll !== "function") {
+            return [];
+        }
+        return Array.from(element.querySelectorAll("[class]"))
+            .filter((candidate) => candidate.classList && Array.from(candidate.classList).some((token) => {
+                if (kind === "track") {
+                    return token.startsWith("track-")
+                        && !token.startsWith("track-before-")
+                        && !token.startsWith("track-after-");
+                }
+                return token.startsWith(`${kind}-`);
+            }));
+    }
+
+    function hasModuleAncestor(element, baseName, boundary) {
+        let current = element && element.parentElement;
+        while (current && current !== boundary) {
+            if (hasModuleClass(current, baseName)) {
+                return true;
+            }
+            current = current.parentElement;
+        }
+        return false;
+    }
+
+    function resolveActiveSeekTarget(documentObject) {
+        const routeRoot = resolveActiveRouteRoot(documentObject);
+        if (!routeRoot) {
+            return null;
+        }
+        const players = descendantsWithModuleClass(routeRoot, "player-container");
+        if (players.length !== 1 || players[0].isConnected === false) {
+            return null;
+        }
+        const controlBars = descendantsWithModuleClass(players[0], "control-bar-container");
+        if (controlBars.length !== 1) {
+            return null;
+        }
+        const seekBars = descendantsWithModuleClass(controlBars[0], "seek-bar-container");
+        if (seekBars.length !== 1) {
+            return null;
+        }
+        const sliders = descendantsWithModuleClass(seekBars[0], "slider-container")
+            .filter((slider) => !hasModuleClass(slider, "volume-slider")
+                && !hasModuleAncestor(slider, "control-bar-buttons-container", controlBars[0]));
+        if (sliders.length !== 1) {
+            return null;
+        }
+        const slider = sliders[0];
+        const nativeLayers = Array.from(slider.children || [])
+            .filter((child) => !hasOwnedMarker(child) && hasModuleClass(child, "layer"));
+        const thumbLayers = nativeLayers.filter((layer) => descendantsWithModuleClass(layer, "thumb").length === 1);
+        if (thumbLayers.length !== 1
+            || descendantsWithExactModuleKind(slider, "track").length !== 1
+            || descendantsWithExactModuleKind(slider, "track-before").length !== 1
+            || descendantsWithExactModuleKind(slider, "track-after").length !== 1) {
+            return null;
+        }
+        return Object.freeze({
+            routeRoot,
+            player: players[0],
+            controlBar: controlBars[0],
+            seekBar: seekBars[0],
+            slider,
+            thumbLayer: thumbLayers[0],
+        });
+    }
+
+    function computeMarkerGeometry(segments, durationMs) {
+        if (!Array.isArray(segments) || !isPositiveSafeInteger(durationMs)) {
+            return [];
+        }
+        const geometry = [];
+        for (const segment of segments) {
+            if (!isPlainObject(segment) || !PROVIDER_TYPES.includes(segment.type)
+                || !Number.isSafeInteger(segment.startMs) || !Number.isSafeInteger(segment.endMs)
+                || segment.startMs < 0 || segment.endMs <= segment.startMs || segment.endMs > durationMs) {
+                continue;
+            }
+            const leftPercent = Math.min(100, Math.max(0, (segment.startMs / durationMs) * 100));
+            const widthPercent = Math.min(100 - leftPercent, Math.max(0, ((segment.endMs - segment.startMs) / durationMs) * 100));
+            if (!(widthPercent > 0)) {
+                continue;
+            }
+            geometry.push(Object.freeze({ segment, leftPercent, widthPercent }));
+        }
+        return geometry;
+    }
+
+    function segmentDisplayName(type) {
+        return ({ recap: "Recap", intro: "Intro", credits: "Credits", preview: "Preview" })[type] || "Segment";
+    }
+
+    function formatTimelineTime(milliseconds) {
+        const totalSeconds = Math.max(0, Math.round(milliseconds / 1000));
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+        return hours > 0
+            ? `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+            : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+    }
+
+    function segmentAccessibleLabel(segment) {
+        return `${segmentDisplayName(segment.type)}, ${formatTimelineTime(segment.startMs)} to ${formatTimelineTime(segment.endMs)}`;
+    }
+
+    class TimelineRenderer {
+        constructor(documentObject) {
+            this.document = documentObject;
+            this.layer = null;
+            this.slider = null;
+            this.tooltip = null;
+            this.geometry = [];
+            this.durationMs = null;
+            this.signature = null;
+            this.listeners = [];
+            this.focusedIndex = null;
+            this.displayedTooltipKey = null;
+        }
+
+        render(bundle, durationMs, contextToken) {
+            const target = resolveActiveSeekTarget(this.document);
+            const geometry = bundle && computeMarkerGeometry(bundle.segments, durationMs);
+            if (!target || !geometry || geometry.length === 0) {
+                this.clear();
+                return 0;
+            }
+            this._removeOwnedLayersExcept(this.layer);
+            const signature = JSON.stringify([
+                contextToken,
+                durationMs,
+                ...geometry.map(({ segment }) => [segment.id, segment.type, segment.startMs, segment.endMs]),
+            ]);
+            if (this.layer && this.layer.isConnected !== false
+                && this.slider === target.slider && this.signature === signature) {
+                if (this.layer.nextSibling !== target.thumbLayer && typeof target.slider.insertBefore === "function") {
+                    target.slider.insertBefore(this.layer, target.thumbLayer);
+                }
+                return geometry.length;
+            }
+
+            this.clear();
+            this._removeOwnedLayersExcept(null);
+            const layer = this.document.createElement("div");
+            layer.setAttribute("data-showskip-owned", "timeline");
+            layer.setAttribute("data-showskip-timeline-layer", "");
+            layer.setAttribute("role", "group");
+            layer.setAttribute("aria-label", "ShowSkip timeline segments");
+            for (const [index, item] of geometry.entries()) {
+                const marker = this.document.createElement("span");
+                marker.setAttribute("data-showskip-timeline-marker", "");
+                marker.setAttribute("data-showskip-segment-type", item.segment.type);
+                marker.setAttribute("data-showskip-marker-index", String(index));
+                marker.setAttribute("role", "img");
+                marker.setAttribute("aria-label", segmentAccessibleLabel(item.segment));
+                marker.tabIndex = 0;
+                marker.style.left = `${item.leftPercent}%`;
+                marker.style.width = `${item.widthPercent}%`;
+                layer.appendChild(marker);
+            }
+            const tooltip = this.document.createElement("span");
+            tooltip.setAttribute("data-showskip-timeline-tooltip", "");
+            tooltip.setAttribute("role", "tooltip");
+            tooltip.hidden = true;
+            layer.appendChild(tooltip);
+            target.slider.insertBefore(layer, target.thumbLayer);
+
+            this.layer = layer;
+            this.slider = target.slider;
+            this.tooltip = tooltip;
+            this.geometry = geometry;
+            this.durationMs = durationMs;
+            this.signature = signature;
+            this._listen(target.slider, "pointermove", (event) => this._handlePointerMove(event), { passive: true });
+            this._listen(target.slider, "pointerleave", () => this._restoreFocusedTooltip(), { passive: true });
+            this._listen(layer, "focusin", (event) => this._handleFocus(event));
+            this._listen(layer, "focusout", () => this._handleFocusOut());
+            return geometry.length;
+        }
+
+        clear() {
+            for (const listener of this.listeners) {
+                listener.target.removeEventListener(listener.type, listener.handler, listener.options);
+            }
+            this.listeners = [];
+            this._removeOwnedLayersExcept(null);
+            removeNode(this.layer);
+            this.layer = null;
+            this.slider = null;
+            this.tooltip = null;
+            this.geometry = [];
+            this.durationMs = null;
+            this.signature = null;
+            this.focusedIndex = null;
+            this.displayedTooltipKey = null;
+        }
+
+        destroy() {
+            this.clear();
+        }
+
+        _handlePointerMove(event) {
+            if (!this.slider || typeof this.slider.getBoundingClientRect !== "function") {
+                return;
+            }
+            const rect = this.slider.getBoundingClientRect();
+            if (!rect || !(rect.width > 0) || typeof event.clientX !== "number") {
+                this._hideTooltip();
+                return;
+            }
+            const fraction = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+            const timeMs = fraction * this.durationMs;
+            const match = this.geometry.find(({ segment }) => timeMs >= segment.startMs && timeMs <= segment.endMs);
+            if (this.focusedIndex !== null && this.geometry[this.focusedIndex]) {
+                this._showTooltip(this.geometry[this.focusedIndex]);
+            } else if (match) {
+                this._showTooltip(match);
+            } else {
+                this._hideTooltip();
+            }
+        }
+
+        _handleFocus(event) {
+            const index = event.target && typeof event.target.getAttribute === "function"
+                ? Number(event.target.getAttribute("data-showskip-marker-index"))
+                : Number.NaN;
+            if (Number.isInteger(index) && this.geometry[index]) {
+                this.focusedIndex = index;
+                this._showTooltip(this.geometry[index]);
+            }
+        }
+
+        _handleFocusOut() {
+            this.focusedIndex = null;
+            this._hideTooltip();
+        }
+
+        _restoreFocusedTooltip() {
+            if (this.focusedIndex !== null && this.geometry[this.focusedIndex]) {
+                this._showTooltip(this.geometry[this.focusedIndex]);
+            } else {
+                this._hideTooltip();
+            }
+        }
+
+        _showTooltip(item) {
+            if (!this.tooltip) {
+                return;
+            }
+            const segment = item.segment;
+            const text = `${segmentDisplayName(segment.type)} · ${formatTimelineTime(segment.startMs)}–${formatTimelineTime(segment.endMs)}`;
+            const left = `${item.leftPercent + (item.widthPercent / 2)}%`;
+            const key = `${segment.id}|${left}|${text}`;
+            if (this.displayedTooltipKey !== key) {
+                if (this.tooltip.textContent !== text) {
+                    this.tooltip.textContent = text;
+                }
+                if (this.tooltip.style.left !== left) {
+                    this.tooltip.style.left = left;
+                }
+                this.displayedTooltipKey = key;
+            }
+            if (this.tooltip.hidden) {
+                this.tooltip.hidden = false;
+            }
+        }
+
+        _hideTooltip() {
+            if (this.tooltip) {
+                this.tooltip.hidden = true;
+            }
+            this.displayedTooltipKey = null;
+        }
+
+        _listen(target, type, handler, options) {
+            target.addEventListener(type, handler, options);
+            this.listeners.push({ target, type, handler, options });
+        }
+
+        _removeOwnedLayersExcept(keep) {
+            if (!this.document || typeof this.document.querySelectorAll !== "function") {
+                return;
+            }
+            for (const candidate of Array.from(this.document.querySelectorAll(TIMELINE_LAYER_SELECTOR))) {
+                if (candidate !== keep) {
+                    removeNode(candidate);
+                }
+            }
+        }
+    }
+
+    class PlayerController {
+        constructor(options) {
+            this.window = options.windowObject;
+            this.document = options.documentObject;
+            this.identityProvider = options.identityProvider;
+            this.provider = options.provider;
+            this.onSchedule = options.onSchedule;
+            this.onProviderUsed = options.onProviderUsed;
+            this.timeline = options.timeline || new TimelineRenderer(this.document);
+            this.AbortController = options.AbortController || this.window.AbortController || globalThis.AbortController;
+            this.route = null;
+            this.identity = null;
+            this.identityAbort = null;
+            this.identityRevalidationPending = false;
+            this.adapter = null;
+            this.unsubscribeMedia = null;
+            this.source = "";
+            this.episodeToken = 0;
+            this.mediaToken = 0;
+            this.requestAbort = null;
+            this.requestDurationMs = null;
+            this.currentBundle = null;
+            this.currentDurationMs = null;
+            this.bundlesByDuration = new Map();
+            this.destroyed = false;
+            this.durationStabilizer = new DurationStabilizer({
+                setTimeout: this.window.setTimeout.bind(this.window),
+                clearTimeout: this.window.clearTimeout.bind(this.window),
+                onStable: ({ scopeKey, durationMs }) => this._lookup(scopeKey, durationMs),
+                onLimit: () => {
+                    this._cancelRequest();
+                    this.currentBundle = null;
+                    this.currentDurationMs = null;
+                    this.timeline.clear();
+                },
+            });
+        }
+
+        async reconcile(route) {
+            if (this.destroyed || !route || route.kind !== "player" || route.eligible !== true) {
+                this.deactivate();
+                return false;
+            }
+            if (typeof this.AbortController !== "function") {
+                this.deactivate();
+                return false;
+            }
+            if (!this.route || this.route.signature !== route.signature) {
+                this.deactivate();
+                this.route = route;
+                this.identityAbort = new this.AbortController();
+            }
+            if (!this.identity || this.identity.identitySource === "route") {
+                const episodeToken = this.episodeToken;
+                const wasRouteOnly = Boolean(this.identity && this.identity.identitySource === "route");
+                this.identityRevalidationPending = wasRouteOnly;
+                const identity = await this.identityProvider.resolve(route, this.identityAbort.signal);
+                this.identityRevalidationPending = false;
+                if (this.destroyed || !this.route || this.route.signature !== route.signature
+                    || episodeToken !== this.episodeToken || this.identityAbort.signal.aborted) {
+                    return false;
+                }
+                if (!identity) {
+                    if (wasRouteOnly) {
+                        this._invalidateIdentity();
+                    }
+                    return false;
+                }
+                this.identity = identity;
+            }
+
+            const video = resolveActiveHtmlVideo(this.document, this.window);
+            if (!video) {
+                this._detachMedia();
+                return false;
+            }
+            if (!this.adapter || this.adapter.video !== video) {
+                this._bindMedia(video);
+            }
+            const snapshot = this.adapter.getSnapshot();
+            if (!snapshot.connected) {
+                this._detachMedia();
+                return false;
+            }
+            if (snapshot.source !== this.source) {
+                this._changeSource(snapshot.source);
+            }
+            if (!snapshot.source || !snapshot.durationMs) {
+                this.timeline.clear();
+                this.durationStabilizer.update(this._scopeKey(), null);
+                return this.identity.identitySource !== "route";
+            }
+
+            if (this.requestDurationMs !== null && this.requestDurationMs !== snapshot.durationMs) {
+                this._cancelRequest();
+            }
+            if (this.currentDurationMs !== snapshot.durationMs) {
+                this.currentBundle = this.bundlesByDuration.get(snapshot.durationMs) || null;
+                this.currentDurationMs = this.currentBundle ? snapshot.durationMs : null;
+                if (!this.currentBundle) {
+                    this.timeline.clear();
+                }
+            }
+            if (this.currentBundle) {
+                this._renderCurrent(snapshot.durationMs);
+            }
+            this.durationStabilizer.update(this._scopeKey(), snapshot.durationMs);
+            return this.identity.identitySource !== "route";
+        }
+
+        invalidateRoute(route) {
+            if (this.route && (!route || route.kind !== "player" || route.signature !== this.route.signature)) {
+                this.deactivate();
+                return true;
+            }
+            return false;
+        }
+
+        deactivate() {
+            this.episodeToken += 1;
+            if (this.identityAbort) {
+                this.identityAbort.abort();
+                this.identityAbort = null;
+            }
+            this._detachMedia();
+            this.route = null;
+            this.identity = null;
+            this.identityRevalidationPending = false;
+        }
+
+        destroy() {
+            if (this.destroyed) {
+                return;
+            }
+            this.destroyed = true;
+            this.deactivate();
+            this.timeline.destroy();
+            this.durationStabilizer.destroy();
+            this.provider.destroy();
+        }
+
+        _bindMedia(video) {
+            this._detachMedia();
+            this.adapter = new HtmlMediaAdapter(this.window, video);
+            this.mediaToken += 1;
+            this.unsubscribeMedia = this.adapter.subscribe(({ type }) => {
+                if (type === "loadedmetadata" || type === "durationchange" || type === "loadstart" || type === "emptied") {
+                    this.onSchedule();
+                }
+            });
+        }
+
+        _detachMedia() {
+            this._cancelRequest();
+            this.durationStabilizer.reset(null);
+            this.timeline.clear();
+            if (this.unsubscribeMedia) {
+                this.unsubscribeMedia();
+                this.unsubscribeMedia = null;
+            }
+            if (this.adapter) {
+                this.adapter.destroy();
+                this.adapter = null;
+            }
+            this.source = "";
+            this.mediaToken += 1;
+            this.currentBundle = null;
+            this.currentDurationMs = null;
+            this.bundlesByDuration = new Map();
+        }
+
+        _changeSource(source) {
+            this._cancelRequest();
+            this.durationStabilizer.reset(null);
+            this.timeline.clear();
+            this.source = source;
+            this.mediaToken += 1;
+            this.currentBundle = null;
+            this.currentDurationMs = null;
+            this.bundlesByDuration = new Map();
+        }
+
+        _scopeKey() {
+            return `${this.episodeToken}|${this.mediaToken}|${this.source.length}:${stableHash(this.source)}`;
+        }
+
+        _lookup(scopeKey, durationMs) {
+            if (this.destroyed || !this.identity || !this.adapter || scopeKey !== this._scopeKey()) {
+                return;
+            }
+            if (!this._liveSnapshot(durationMs)) {
+                return;
+            }
+            if (this.bundlesByDuration.has(durationMs)) {
+                this.currentBundle = this.bundlesByDuration.get(durationMs);
+                this.currentDurationMs = durationMs;
+                this._renderCurrent(durationMs);
+                return;
+            }
+            this._cancelRequest();
+            const episodeToken = this.episodeToken;
+            const mediaToken = this.mediaToken;
+            const routeSignature = this.route.signature;
+            const requestAbort = new this.AbortController();
+            this.requestAbort = requestAbort;
+            this.requestDurationMs = durationMs;
+            void this.provider.fetchEpisode(this.identity, durationMs, requestAbort.signal)
+                .then((result) => {
+                    if (this.destroyed || requestAbort.signal.aborted || episodeToken !== this.episodeToken
+                        || mediaToken !== this.mediaToken || !this.route || this.route.signature !== routeSignature
+                        || scopeKey !== this._scopeKey() || !this._liveSnapshot(durationMs)) {
+                        return;
+                    }
+                    if (result.kind === "segments") {
+                        this.bundlesByDuration.set(durationMs, result.bundle);
+                        this.currentBundle = result.bundle;
+                        this.currentDurationMs = durationMs;
+                        this._renderCurrent(durationMs);
+                    } else {
+                        this.currentBundle = null;
+                        this.currentDurationMs = null;
+                        this.timeline.clear();
+                    }
+                })
+                .catch((error) => {
+                    if (!error || error.name !== "AbortError") {
+                        this.timeline.clear();
+                    }
+                })
+                .finally(() => {
+                    if (this.requestAbort === requestAbort) {
+                        this.requestAbort = null;
+                        this.requestDurationMs = null;
+                    }
+                    this.onSchedule();
+                });
+        }
+
+        _renderCurrent(durationMs) {
+            if (!this.currentBundle || !this.identity || this.identityRevalidationPending
+                || this.currentDurationMs !== durationMs || !this._liveSnapshot(durationMs)) {
+                return;
+            }
+            const rendered = this.timeline.render(
+                this.currentBundle,
+                durationMs,
+                `${this.episodeToken}:${this.mediaToken}`,
+            );
+            if (rendered > 0) {
+                this.onProviderUsed(this.identity.showKey);
+            }
+        }
+
+        _cancelRequest() {
+            if (this.requestAbort) {
+                this.requestAbort.abort();
+                this.requestAbort = null;
+            }
+            this.requestDurationMs = null;
+        }
+
+        _liveSnapshot(durationMs) {
+            if (!this.adapter || resolveActiveHtmlVideo(this.document, this.window) !== this.adapter.video) {
+                return null;
+            }
+            const snapshot = this.adapter.getSnapshot();
+            return snapshot.connected && snapshot.source === this.source && snapshot.durationMs === durationMs
+                ? snapshot
+                : null;
+        }
+
+        _invalidateIdentity() {
+            this.episodeToken += 1;
+            if (this.identityAbort) {
+                this.identityAbort.abort();
+            }
+            this._detachMedia();
+            this.identity = null;
+            this.identityRevalidationPending = false;
+            this.identityAbort = new this.AbortController();
+        }
+    }
+
     function stableHash(value) {
         let hash = 2166136261;
         for (let index = 0; index < value.length; index += 1) {
@@ -1088,6 +2753,77 @@
                 font-size: 0.72rem;
                 line-height: 1.35;
             }
+            [data-showskip-panel] .showskip-attribution {
+                margin: 0.52rem 0 0;
+                color: var(--showskip-secondary-text);
+                font-size: 0.7rem;
+                line-height: 1.35;
+            }
+            [data-showskip-panel] .showskip-attribution a {
+                color: var(--showskip-primary-text);
+                text-decoration: underline;
+                text-underline-offset: 0.14em;
+            }
+            [data-showskip-timeline-layer] {
+                position: absolute;
+                inset: 0;
+                z-index: 0;
+                pointer-events: none;
+            }
+            [class^="overlayHidden-"] [data-showskip-timeline-layer],
+            [class*=" overlayHidden-"] [data-showskip-timeline-layer] {
+                visibility: hidden;
+            }
+            [data-showskip-timeline-marker] {
+                position: absolute;
+                top: 50%;
+                box-sizing: border-box;
+                min-width: 1px;
+                height: var(--track-size, 0.3rem);
+                border: 1px solid rgba(10, 9, 14, 0.56);
+                border-radius: 999px;
+                opacity: 0.76;
+                pointer-events: none;
+                transform: translateY(-50%);
+                box-shadow: 0 0 0.16rem rgba(0, 0, 0, 0.42);
+            }
+            [data-showskip-timeline-marker][data-showskip-segment-type="recap"] {
+                background: #e8a23a;
+            }
+            [data-showskip-timeline-marker][data-showskip-segment-type="intro"] {
+                background: #f3ce55;
+            }
+            [data-showskip-timeline-marker][data-showskip-segment-type="credits"] {
+                background: #70a9f5;
+            }
+            [data-showskip-timeline-marker][data-showskip-segment-type="preview"] {
+                background: #63c985;
+            }
+            [data-showskip-timeline-marker]:focus-visible {
+                z-index: 1;
+                opacity: 1;
+                outline: 2px solid #f8f7fb;
+                outline-offset: 1px;
+            }
+            [data-showskip-timeline-tooltip] {
+                position: absolute;
+                bottom: calc(50% + 0.72rem);
+                max-width: min(18rem, 70vw);
+                padding: 0.28rem 0.46rem;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 0.38rem;
+                color: #f8f7fb;
+                background: rgba(24, 21, 33, 0.96);
+                box-shadow: 0 0.32rem 0.9rem rgba(0, 0, 0, 0.38);
+                font-size: 0.72rem;
+                line-height: 1.25;
+                white-space: nowrap;
+                pointer-events: none;
+                transform: translateX(-50%);
+            }
+            [data-showskip-timeline-tooltip][hidden] {
+                display: none;
+            }
             @media screen and (max-width: 640px) {
                 [data-showskip-panel] {
                     left: max(0.75rem, env(safe-area-inset-left)) !important;
@@ -1143,9 +2879,10 @@
             this.positionFrame = null;
             this.listeners = [];
             this.mutationRevision = 0;
+            this.attributionVisible = false;
         }
 
-        activate(context, profile) {
+        activate(context, profile, attributionVisible = false) {
             const actionRow = resolveActiveActionRow(this.document);
             if (!actionRow) {
                 this._removePresentation();
@@ -1167,6 +2904,7 @@
 
             this.context = context;
             this.profile = profile;
+            this.attributionVisible = attributionVisible === true;
             this.actionRow = actionRow;
 
             const result = ensureSingleOwnedNode(
@@ -1200,6 +2938,7 @@
             this.context = null;
             this.profile = null;
             this.actionRow = null;
+            this.attributionVisible = false;
         }
 
         destroy() {
@@ -1412,6 +3151,32 @@
                     note.textContent = message;
                 }
             }
+            this._syncAttribution();
+        }
+
+        _syncAttribution() {
+            if (!this.panel || !this.panel.isConnected) {
+                return;
+            }
+            let attribution = this.panel.querySelector("[data-showskip-attribution]");
+            if (!this.attributionVisible) {
+                removeNode(attribution);
+                return;
+            }
+            if (!attribution) {
+                attribution = this.document.createElement("p");
+                attribution.className = "showskip-attribution";
+                attribution.setAttribute("data-showskip-attribution", "");
+                const prefix = this.document.createElement("span");
+                prefix.textContent = "Timestamp data by ";
+                const link = this.document.createElement("a");
+                link.href = THEINTRODB_ATTRIBUTION_URL;
+                link.target = "_blank";
+                link.rel = "noreferrer";
+                link.textContent = "TheIntroDB";
+                attribution.append(prefix, link);
+                this.panel.appendChild(attribution);
+            }
         }
 
         _syncLauncherState() {
@@ -1541,12 +3306,30 @@
             this.logger = createLogger(api);
             this.store = new ProfileStore(api, this.logger);
             this.contextDetector = new ContextDetector(windowObject);
+            this.coreStateReader = new CoreStateReader(windowObject);
+            this.episodeIdentityProvider = new EpisodeIdentityProvider(this.contextDetector, this.coreStateReader);
+            this.providerUsedShows = new Set();
+            this.segmentProvider = new TheIntroDBProvider({
+                fetch: typeof windowObject.fetch === "function" ? windowObject.fetch.bind(windowObject) : null,
+                setTimeout: windowObject.setTimeout.bind(windowObject),
+                clearTimeout: windowObject.clearTimeout.bind(windowObject),
+                AbortController: windowObject.AbortController,
+            });
             this.showPage = new ShowPageController(
                 windowObject,
                 documentObject,
                 this.store,
                 () => this.scheduleReconcile(),
             );
+            this.player = new PlayerController({
+                windowObject,
+                documentObject,
+                identityProvider: this.episodeIdentityProvider,
+                provider: this.segmentProvider,
+                onSchedule: () => this.scheduleReconcile(),
+                onProviderUsed: (showKey) => this.providerUsedShows.add(showKey),
+                AbortController: windowObject.AbortController,
+            });
             this.documentObserver = null;
             this.loaderObserver = null;
             this.style = null;
@@ -1584,6 +3367,7 @@
                 this.generation += 1;
                 this._clearRetry();
                 this.showPage.deactivate();
+                this.player.deactivate();
                 this.scheduleReconcile();
             });
             this._listen(this.window, "resize", () => this.showPage.reposition());
@@ -1629,6 +3413,7 @@
             }
             this.listeners = [];
             this.showPage.destroy();
+            this.player.destroy();
             for (const node of this.document.querySelectorAll(OWNED_SELECTOR)) {
                 removeNode(node);
             }
@@ -1647,10 +3432,26 @@
             this._invalidateStalePresentation(context);
             const generation = this.generation;
             const controllerRevision = this.showPage.mutationRevision;
-            if (context.kind !== "seriesDetail") {
-                this._clearRetry();
+            if (context.kind === "player") {
+                this.showPage.deactivate();
+                const active = await this.player.reconcile(context);
+                if (this.destroyed || generation !== this.generation) {
+                    return;
+                }
+                if (active || context.eligible !== true) {
+                    this._clearRetry();
+                } else {
+                    this._scheduleBoundedRetry(context.signature);
+                }
                 return;
             }
+            if (context.kind !== "seriesDetail") {
+                this._clearRetry();
+                this.showPage.deactivate();
+                this.player.deactivate();
+                return;
+            }
+            this.player.deactivate();
 
             const result = await this.store.getOrCreateProfile(context.showKey);
             if (this.destroyed || generation !== this.generation) {
@@ -1669,7 +3470,7 @@
                 controllerRevision,
                 result.profile,
             );
-            const mounted = this.showPage.activate(context, profile);
+            const mounted = this.showPage.activate(context, profile, this.providerUsedShows.has(context.showKey));
             if (mounted) {
                 this._clearRetry();
             } else {
@@ -1679,16 +3480,16 @@
 
         _invalidateStalePresentation(context) {
             const mounted = this.showPage.context;
-            if (!mounted) {
-                return;
-            }
-            const matches = context.kind === "seriesDetail"
+            const showMatches = !mounted || (context.kind === "seriesDetail"
                 && context.showKey === mounted.showKey
-                && context.signature === mounted.signature;
-            if (!matches) {
+                && context.signature === mounted.signature);
+            const playerInvalidated = this.player.invalidateRoute(context);
+            if (!showMatches || playerInvalidated) {
                 this.generation += 1;
                 this._clearRetry();
-                this.showPage.deactivate();
+                if (!showMatches) {
+                    this.showPage.deactivate();
+                }
             }
         }
 
@@ -1751,19 +3552,42 @@
                 DEFAULT_PROFILE_VALUES,
                 PANEL_PALETTE,
                 PANEL_ROWS,
+                PROVIDER_LIMITS,
                 ProfileStore,
                 CoalescedScheduler,
+                CoreStateReader,
+                DurationStabilizer,
+                EpisodeIdentityProvider,
+                HtmlMediaAdapter,
+                PlayerController,
+                SessionSegmentCache,
                 ShowPageController,
+                TheIntroDBProvider,
+                TimelineRenderer,
+                buildTheIntroDbUrl,
                 canonicalShowKey,
+                classifyCorePlayerState,
+                computeMarkerGeometry,
+                createEpisodeIdentity,
                 createDefaultProfile,
                 createStyles,
                 ensureSingleOwnedNode,
+                formatTimelineTime,
                 inspectJsonValue,
+                normalizeDurationMs,
+                normalizeProviderSegment,
                 normalizeState,
                 parseRoute,
+                parseEpisodeVideoId,
+                providerCacheKey,
                 resolveActiveActionRow,
+                resolveActiveHtmlVideo,
+                resolveActiveRouteRoot,
+                resolveActiveSeekTarget,
+                segmentAccessibleLabel,
                 selectReconcileProfile,
                 serializedByteLength,
+                validateTheIntroDbResponse,
             }),
         });
         return;

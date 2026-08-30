@@ -1,15 +1,15 @@
 # ShowSkip Architecture
 
-Status: Phase 1.1 contrast fix implemented; packaged load/render user-confirmed; corrected visual recheck pending
+Status: Phase 2 provider/timeline implementation complete; automated and public-web DOM validation complete; packaged Enhanced Phase 2 validation pending
 Research date: 2026-08-20
 Target: Stremio Enhanced for Windows
 Artifact: one self-contained `ShowSkip.plugin.js`
 
 ## 1. Scope and non-goals
 
-ShowSkip is a Stremio Enhanced UI/player plugin, not a Stremio addon. Phase 1 provides per-series playback-rule configuration for recap, intro, credits, preview, and next-episode behavior; later phases will apply those rules. The configuration surface belongs on each series detail page. Timeline regions will remain visible whenever timestamps and the native seek bar are available, regardless of the selected skip behavior.
+ShowSkip is a Stremio Enhanced UI/player plugin, not a Stremio addon. Phase 1 provides per-series playback-rule configuration for recap, intro, credits, preview, and next-episode behavior. Phase 2 resolves active episode/media context, fetches and validates TheIntroDB timestamps, and renders behavior-independent timeline regions whenever a supported HTML video and native seek bar are available. Later phases may apply the saved rules; Phase 2 never seeks, skips, or advances playback.
 
-Phase 0 contained no production plugin, UI, player mutation, or server component. Phase 1 adds only the standalone plugin foundation and per-show configuration UI described in section 14. The project does not modify Stremio Enhanced, Stremio Web, normal Stremio, Stremio Service, or `server.js`.
+Phase 0 contained no production plugin, UI, player mutation, or server component. Phase 1 added the standalone foundation and per-show configuration UI recorded in section 14. Phase 2 adds only the client-side episode/provider/timeline implementation recorded in section 15. The project does not modify Stremio Enhanced, Stremio Web, normal Stremio, Stremio Service, or `server.js`.
 
 ## 2. Research baseline
 
@@ -22,6 +22,8 @@ All repository conclusions below are pinned to commits rather than floating bran
 | [Stremio/stremio-web](https://github.com/Stremio/stremio-web) | [`89927a60d104b94ae07486a317edefeb93e4f79a`](https://github.com/Stremio/stremio-web/commit/89927a60d104b94ae07486a317edefeb93e4f79a), `development`, 2026-08-19 | 5.0.0-beta.39 |
 | [Stremio/stremio-video](https://github.com/Stremio/stremio-video) | [`607afd84e83ae4260b5ef24a3b328eb3f898cb3c`](https://github.com/Stremio/stremio-video/commit/607afd84e83ae4260b5ef24a3b328eb3f898cb3c), the npm `gitHead` used by current Stremio Web | 0.0.93 |
 | [TheIntroDB API reference](https://theintrodb.org/docs) | Live documentation and [OpenAPI 3.0 specification](https://theintrodb.org/openapi.yaml), read 2026-08-20 | API v3.0.0 |
+
+The Phase 2 seek-bar recheck also compared the official `v5.0.0-beta.39` Stremio Web tag at [`94a7be7c11e72bca1f8b7aa44cbdb5755a8cc7e1`](https://github.com/Stremio/stremio-web/commit/94a7be7c11e72bca1f8b7aa44cbdb5755a8cc7e1) with development commit [`115f09fab22252cd277cd70856124a6b4714b65f`](https://github.com/Stremio/stremio-web/commit/115f09fab22252cd277cd70856124a6b4714b65f). The release renders the slider directly beneath the seek bar; the later development source adds a wrapper. Phase 2 accepts either structure only after the same seek-specific native layers validate. The older pinned row remains the reference for source links elsewhere in this document.
 
 The deployed `https://web.stremio.com/` UI was also inspected on 2026-08-20. Settings reported App Version `6.0.1-beta.09`, Build Version `6ed4463d94baf972dda2630c914ce91c747f9f7c`, and Server Version `4.20.17`. The build string appears in the main asset path, but its linked GitHub tree currently returns 404; it is not treated as a verified Git commit. Pinned source findings and live deployment observations are therefore kept distinct.
 
@@ -64,7 +66,7 @@ The current artifact begins with this block, with no earlier JSDoc comment:
  * @name ShowSkip
  * @description Per-show segment skipping and next-episode rules for Stremio Enhanced.
  * @updateUrl none
- * @version 0.1.1
+ * @version 0.2.0
  * @author ShowSkip contributors
  */
 ```
@@ -107,11 +109,11 @@ There is no generic plugin storage service. `saveSetting` writes JSON values int
 
 The implementation reads and rewrites the JSON object for each save. A first `getSetting` call rejects after creating an absent config file; later missing keys resolve to `null`. See [`SettingsApiController.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/controllers/api/SettingsApiController.ts#L11-L61).
 
-ShowSkip will use `getSetting`/`saveSetting` directly and will not register global Settings controls in Phase 1. This keeps per-show behavior on the series page as required. On the first rejection, the storage adapter retries once because Enhanced may just have created the absent config file; a subsequent `null` is a clean empty store. A repeated rejection is treated as unreadable/corrupt storage: the UI uses in-memory defaults, persistence is disabled for that session, and one warning is logged rather than attempting raw file repair or destructive overwrite.
+ShowSkip uses `getSetting`/`saveSetting` directly and does not register global Settings controls. This keeps per-show behavior on the series page as required. On the first rejection, the storage adapter retries once because Enhanced may just have created the absent config file; a subsequent `null` is a clean empty store. A repeated rejection is treated as unreadable/corrupt storage: the UI uses in-memory defaults, persistence is disabled for that session, and one warning is logged rather than attempting raw file repair or destructive overwrite.
 
 `registerSettings` and `onSettingsSaved` are deliberately avoided. The former accepts only input/toggle/select schemas and its process-lifetime registration can conflict after a renderer reload; the latter has no unsubscribe and delivers the whole config after replacing prior listeners for that plugin channel. Those behaviors are documented in [`settings.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/preload/api/settings.ts) and [`SettingsApiController.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/controllers/api/SettingsApiController.ts).
 
-Profile mutations will run through one serialized read/validate/update/save queue. Main-process file writes are synchronous, but renderer calls are asynchronous; serialization prevents an older plugin-side `state_v1` snapshot from overwriting a newer panel change.
+Profile mutations run through one serialized read/validate/update/save queue. Main-process file writes are synchronous, but renderer calls are asynchronous; serialization prevents an older plugin-side `state_v1` snapshot from overwriting a newer panel change.
 
 ### 3.5 Disable and cleanup limitations
 
@@ -123,7 +125,7 @@ Host operations differ:
 - **Uninstall:** removes the `.plugin.js` file and enabled entry but not the already-injected script node; the current instance can remain active until pagehide/reload. The generated `ShowSkip.plugin.json` is retained. See [`ModManager.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/core/ModManager.ts#L70-L80).
 - **Update:** overwrites the plugin file but does not re-execute the running instance; the new code starts after reload. See [`modController.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/preload/ui/mod/modController.ts#L279-L284).
 
-ShowSkip will still be designed for reversible cleanup:
+ShowSkip implements reversible cleanup:
 
 - keep one global singleton (`window.__showSkipPlugin`);
 - destroy an older singleton before starting a new one;
@@ -157,14 +159,16 @@ The current first-party [API reference](https://theintrodb.org/docs) and [OpenAP
 - the read schema explicitly calls out a null intro start; submission business rules also allow recap null/zero as beginning-of-media, so ShowSkip defensively accepts that cross-section-compatible form; credits/preview may end at `null` (end of media);
 - zero has type-specific sentinel meaning: an intro/recap may legitimately start at zero, but a credits/preview start of zero means no segment; an end of zero means no segment for every type;
 - absent segment types are omitted;
-- the current OpenAPI schema does not promise confidence or submission counts, although the [current official client tolerates similarly named fields](https://github.com/TheIntroDB/theintrodb-npm/blob/842937ffd825bb79284ad8a1ee78a79068abc7fc/src/funcs.ts#L413-L473). ShowSkip will not trust undocumented fields: the normalized slots remain `null` until a documented contract defines their names, types, and ranges;
+- the current OpenAPI schema does not promise confidence or submission counts, although the [current official client tolerates similarly named fields](https://github.com/TheIntroDB/theintrodb-npm/blob/842937ffd825bb79284ad8a1ee78a79068abc7fc/src/funcs.ts#L413-L473). ShowSkip does not trust undocumented fields: `confidence` remains `null`, and no submission-count field is emitted;
 - 400 is an invalid request, 404 is no accepted media data, 429 is a rate/usage limit, and 500 is a server failure.
 
 The OpenAPI document states an anonymous `GET /media` usage limit of 500 requests per IP per day and an endpoint rate limit of 30 requests per 10 seconds. ShowSkip therefore needs request deduplication, an in-memory session cache, aborts, and restrained retry behavior. A short endpoint-rate limit and an exhausted daily usage allowance are different states even though both use HTTP 429.
 
-The [live endpoint was sampled](https://api.theintrodb.org/v3/media?imdb_id=tt0903747&season=1&episode=1) on 2026-08-20. It returned `tmdb_id: 1396`, `type: tv`, season/episode 1/1, an intro range, and credits with `end_ms: null`. The production plugin must validate every response rather than assume the sample. The current OpenAPI does not specify 204, but the official plugin treats 204 like no data; ShowSkip will tolerate it as an empty legacy response while treating 404 as the current negative result.
+The [live endpoint was sampled](https://api.theintrodb.org/v3/media?imdb_id=tt0903747&season=1&episode=1) on 2026-08-20. It returned `tmdb_id: 1396`, `type: tv`, season/episode 1/1, an intro range, and credits with `end_ms: null`. The production plugin validates every response rather than assuming the sample. The current OpenAPI does not specify 204, but the official plugin treats 204 like no data; ShowSkip tolerates it as an empty legacy response while treating 404 as the current negative result.
 
-Fetch policy is deliberately bounded: require the observed media duration to be finite and greater than zero, wait for a tested 750 ms quiet window after duration changes, round it to a positive safe integer, and send that exact value as `duration_ms` with `Accept: application/json` and no API key. Deduplicate by the canonical request URL and key the small in-memory session LRU by provider, canonical episode identity, the exact normalized `duration_ms`, and auth mode; a coarse duration bucket could select timestamps for a different release cut. Permit at most two distinct duration-key lookups per media-source/context token; a source replacement creates a new token, while further jitter fails closed instead of spending quota. Cache only validated 200 results and explicit 404/legacy-204 negative results—never aborts, malformed bodies, 429s, network failures, or 5xx responses. Abort on context-token changes. A transient network error or 5xx may receive a short capped retry. A short rate-limit 429 may receive at most one bounded retry only when a numeric `X-RateLimit-Reset` value validates and fits the cap; `code: usage_limit_exceeded`, usage-limit headers, or a long/human-readable body `retry_after` make the request terminal for the session. Other 4xx responses are terminal. No response is allowed to update a controller whose episode/context token is no longer current.
+The implemented fetch policy is deliberately bounded. It requires a finite positive observed duration, waits for a 750 ms quiet window, rounds to a positive safe integer, and sends that exact `duration_ms` with `Accept: application/json`. Requests are direct anonymous GETs with omitted credentials, `no-store`, redirect rejection, and no referrer or API key. In-flight callers deduplicate by the canonical exact-duration cache key while retaining independent cancellation; the underlying fetch aborts when its context ends or every subscriber cancels. The session-only LRU holds at most 24 validated results. At most two distinct duration keys may issue per media-source/context token, and source/context replacement resets stabilization.
+
+Each attempt has an 8-second lifetime covering both response headers and body consumption, and a response is rejected above 256 KiB by declared length, streamed byte count, decoded-text byte count, or validated serialized size. A network error, timeout, or 5xx receives at most one retry after a short abortable delay. A 429 receives at most one retry only when `X-RateLimit-Reset` is a non-negative integer delay within the 2-second cap. Exact `code: usage_limit_exceeded` or `X-UsageLimit-Remaining: 0` evidence marks the session daily-exhausted; other 429s stop only that lookup. Cache lookup intentionally precedes the daily-limit gate, so already-validated results remain usable. Only validated 200 results and explicit 404/legacy-204 negatives are cached—never aborts, malformed/oversized bodies, other 4xx, 429, network failures, or 5xx. Live route, video identity, source, duration, and monotonic episode/media tokens are all rechecked before rendering a completion.
 
 ### 4.2 Findings from the official Enhanced plugin
 
@@ -178,7 +182,7 @@ The current TheIntroDB plugin is distributed under [GPL-3.0](https://github.com/
 - scopes its marker implementation only to a generic slider selector at [lines 902–918](https://github.com/TheIntroDB/stremio-enhanced-plugin/blob/d9e5e4d96ba430f85e456272d3099d03d8ac63cf/tidb.plugin.js#L902-L918);
 - provides explicit media cleanup and singleton replacement at [lines 1109–1157](https://github.com/TheIntroDB/stremio-enhanced-plugin/blob/d9e5e4d96ba430f85e456272d3099d03d8ac63cf/tidb.plugin.js#L1109-L1157).
 
-ShowSkip will independently implement the documented API contract. It will reuse the useful concepts—state-first episode context, duration-aware lookup, normalized segment arrays, reconciliation, and explicit teardown—but will not copy GPL implementation bodies. It will not include the reference plugin's analytics, user-stats request, global settings UI, or remote SVG icon.
+ShowSkip independently implements the documented API contract. It uses the useful concepts—state-first episode context, duration-aware lookup, normalized segment arrays, reconciliation, and explicit teardown—but does not copy GPL implementation bodies. It excludes the reference plugin's analytics, user-stats request, global settings UI, and remote SVG icon.
 
 The eventual ShowSkip `LICENSE` will cover ShowSkip code only. It will not purport to license or grant redistribution rights to TheIntroDB timestamp data; a separate notice will preserve that code/data distinction. Clean implementation means no copied or cosmetically renamed GPL functions or assets.
 
@@ -191,9 +195,9 @@ The Terms also state that users are expected to have legal access to the underly
 Architecture consequences:
 
 - every request originates from the user's Enhanced renderer directly to `api.theintrodb.org`;
-- segment responses are held only in memory for the playback session and are not written to `ShowSkip.plugin.json`;
+- validated segment results are held only in memory for the current plugin/renderer session and are not written to `ShowSkip.plugin.json`;
 - ShowSkip does not scrape, bulk fetch, proxy, mirror, or redistribute timestamps;
-- once Phase 2 actually uses provider data, the open per-show panel will voluntarily include unobtrusive “Timestamp data by TheIntroDB” attribution using the destination currently specified by the Terms, `https://theintrodb.com`. Attribution is requested but not required by default; written notice can make it required on 14 days' notice. A panel that disappears when closed is not assumed to satisfy a future mandatory-attribution notice, so placement and the `.com`/official `.org` discrepancy must both be rechecked before release;
+- only after at least one TheIntroDB marker actually renders, an in-memory per-show flag causes that show's open panel to include unobtrusive “Timestamp data by TheIntroDB” attribution using the exact destination currently specified by the Terms, `https://theintrodb.com`. The flag and provider data are not persisted, and no-data episodes do not create attribution. Attribution is requested but not required by default; written notice can make it required on 14 days' notice. A panel that disappears when closed is not assumed to satisfy a future mandatory-attribution notice, so placement and the `.com`/official `.org` discrepancy must both be rechecked before release;
 - the release remains non-commercial unless separate terms are obtained.
 
 ## 5. Stremio Web context and DOM findings
@@ -218,7 +222,11 @@ Canonical show key policy:
 2. Otherwise store `stremio:series:<percent-encoded exact id>`.
 3. Never use the episode `videoId` as the profile key.
 
-For player context, prefer a ready player state containing meta ID plus `seriesInfo.season` and `seriesInfo.episode`. Route fallback is accepted only when the decoded `videoId` ends in an anchored `:<positive season>:<positive episode>` suffix **and** the exact remaining prefix equals the decoded route `id`; otherwise identity fails closed. This handles route IDs that themselves contain colons without treating arbitrary trailing numbers as episode proof. Canonical profile identity and provider eligibility are separate: the current TheIntroDB contract accepts only `^tt[0-9]{7,8}$`, so a longer valid IMDb-style profile ID remains usable for preferences but the provider declines it until its API supports that form. A non-IMDb Stremio profile ID is likewise stable for preferences but is not automatically a valid TheIntroDB TMDB ID.
+The implemented player parser accepts only the exact seven-component route shape `player/stream/streamTransport/metaTransport/type/id/videoId`; the two transport slots may be empty, but type must decode to `series`. A short `#/player/:stream` route is recognized as a player but deliberately marked ineligible, which covers the currently observed trailer route. Route episode fallback is accepted only when decoded `videoId` ends in an anchored `:<positive season>:<positive episode>` suffix **and** the exact remaining prefix equals decoded route `id`; otherwise identity fails closed. This handles route IDs that themselves contain colons without treating arbitrary trailing numbers as episode proof.
+
+`CoreStateReader` captures and binds up to six validated readers from current or previously observed `core.getState`, `services.core.getState`, and `services.core.transport.getState` owners. Currently present readers take priority over retained readers, and each read is bounded. `EpisodeIdentityProvider` accepts only a `Ready` series player state whose meta ID and season/episode match the route; any present selected request or library video ID must also agree. Loading/not-requested state is unavailable, while a contradictory ready/terminal shape invalidates route-only work and clears media, requests, and markers. A later core match promotes route-only identity to `route+core`. Every async boundary rechecks the active route signature and monotonic episode/media token.
+
+Canonical profile identity and provider eligibility remain separate. The current runtime identity path exposes an IMDb provider ID only when the series ID matches `^tt[0-9]{7,8}$`; it never invents TMDB/TVDB identity or reinterprets an arbitrary Stremio ID. Longer IMDb-style and non-IMDb IDs remain valid namespaced profile keys but receive no TheIntroDB request in Phase 2.
 
 ### 5.2 Series action row
 
@@ -261,17 +269,17 @@ The current player renders a container into which `@stremio/stremio-video` mount
 
 Stremio Enhanced is a different Electron wrapper from the official Windows shell. Its pinned source loads `https://web.stremio.com/` and, on Windows, lets the user supply a local streaming backend through Stremio Service or managed `server.js`; see [`main.ts` lines 91–125](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/main.ts#L91-L125) and [lines 167–187](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/main.ts#L167-L187). It does not supply the official WebView2 shell transport, which current Stremio Web recognizes through [`useShell.ts`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/common/Platform/shell/useShell.ts#L4-L6). ShowSkip touches neither streaming backend.
 
-It is therefore a source-supported inference—not yet a target-runtime observation—that ordinary built-in playback in Enhanced 1.2.0 exposes an HTML `<video>`. Live public-web validation with a public-domain stream showed `<video playsinline>` under the current player container, and the official TheIntroDB Enhanced plugin relies on the same path. Stremio itself scopes HTML-media lookup through its video host at [`Player.js` lines 92–98](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/routes/Player/Player.js#L92-L98). Phase 2 must still confirm this inside Enhanced.
+It is therefore a source-supported inference—not yet a target-runtime observation—that ordinary built-in playback in Enhanced 1.2.0 exposes an HTML `<video>`. Live public-web validation with a public-domain stream showed `<video playsinline>` under the current player container, and the official TheIntroDB Enhanced plugin relies on the same path. Stremio itself scopes HTML-media lookup through its video host at [`Player.js` lines 92–98](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/routes/Player/Player.js#L92-L98). Packaged Enhanced confirmation with a real built-in series stream remains required.
 
-The assumption has explicit limits: YouTube, Chromecast, external-player, and any future shell-backed path may not expose `<video>`. A live YouTube trailer rendered an iframe and no page-level video. ShowSkip will capability-detect the current medium and use an `HtmlVideoAdapter` only when exactly one connected, visible video with a real `currentSrc` is found under the active native player host. Zero or multiple eligible candidates fail closed. Features gate independently: provider selection/markers require a finite duration greater than zero, button/auto rules require an observed clock plus safe seek, and automatic rules require sufficiently precise events. Missing capabilities fail closed for the affected features.
+The assumption has explicit limits: YouTube, Chromecast, external-player, and any future shell-backed path may not expose `<video>`. A live YouTube trailer rendered an iframe and no page-level video. Phase 2's `HtmlMediaAdapter` is created only when the last active route root contains exactly one visible player container, exactly one visible video container, and exactly one connected visible `<video>`. Zero or multiple candidates fail closed. The adapter exposes read-only snapshots of current time, rounded duration, ready state, and source plus media-event subscription; `capabilities.canSeek` is always `false`, and it contains no setters or seek method. A non-empty source and finite positive duration are additionally required before lookup or markers.
 
 Enhanced's optional MPV/VLC setting is a separate external-process flow, not Stremio Web's `ShellVideo`. When enabled, Enhanced backs out of the built-in player before launching the external executable in [`externalPlayerInterceptor.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/preload/ui/externalPlayerInterceptor.ts#L15-L50). The scoped plugin API supplies no external-player clock, duration, subscription, or seek surface. ShowSkip therefore provides no on-page markers or skipping in external-player mode. It will not attempt raw MPV IPC, React internals, or synthetic seek-bar dragging.
 
-For the supported path, `HTMLVideo` creates and attaches the element in [`HTMLVideo.js` lines 18–100](https://github.com/Stremio/stremio-video/blob/607afd84e83ae4260b5ef24a3b328eb3f898cb3c/src/HTMLVideo/HTMLVideo.js#L18-L100), and Stremio's own abstraction seeks by assigning `currentTime` after converting milliseconds to seconds at [lines 415–418](https://github.com/Stremio/stremio-video/blob/607afd84e83ae4260b5ef24a3b328eb3f898cb3c/src/HTMLVideo/HTMLVideo.js#L415-L418). ShowSkip may use the equivalent DOM operation only through its scoped adapter and must verify that Stremio UI/resume state follows it during Phase 2/3 testing.
+For the supported path, `HTMLVideo` creates and attaches the element in [`HTMLVideo.js` lines 18–100](https://github.com/Stremio/stremio-video/blob/607afd84e83ae4260b5ef24a3b328eb3f898cb3c/src/HTMLVideo/HTMLVideo.js#L18-L100), and Stremio's own abstraction seeks by assigning `currentTime` after converting milliseconds to seconds at [lines 415–418](https://github.com/Stremio/stremio-video/blob/607afd84e83ae4260b5ef24a3b328eb3f898cb3c/src/HTMLVideo/HTMLVideo.js#L415-L418). That is host research for a future Phase 3 gate only; Phase 2's adapter performs no equivalent write.
 
 The seek bar renders a `Slider` between time labels in [`SeekBar.js`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/routes/Player/ControlBar/SeekBar/SeekBar.js#L44-L69). The slider owns four absolute layers: base track, buffered track, played/masked track, and thumb; see [`Slider.js`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/components/Slider/Slider.js#L134-L153) and [`Slider/styles.less`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/components/Slider/styles.less#L19-L92). CSS modules compile with generated suffixes, so those suffixes are never selectors; see [`webpack.config.js`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/webpack.config.js#L91-L98).
 
-Live validation confirmed that seek and volume controls share the same slider class. Therefore a global “first slider” selector is unsafe.
+Current public-web validation reconfirmed that seek and volume controls share the same generated slider class. It also observed the active `player-container-*` → `control-bar-container-*` → `seek-bar-container-*` hierarchy and the current four native slider layers (track, before, after, thumb). Therefore a global “first slider” selector is unsafe, and generated suffixes remain evidence rather than production selectors.
 
 Chosen marker anchor:
 
@@ -282,17 +290,17 @@ current player container
       └─ slider container   ← ShowSkip overlay host
 ```
 
-The timeline renderer will add one `pointer-events: none`, `aria-hidden` overlay to the seek slider only, immediately before the native final/thumb layer so regions paint over the track but below the thumb. Marker geometry is calculated only after guarding that `actualDurationMs` is finite and greater than zero, then uses `effectiveStartMs / actualDurationMs` and `(effectiveEndMs - effectiveStartMs) / actualDurationMs`, clamped to `[0, 100]`. A single passive slider `pointermove` handler can calculate hover time and display a small plugin tooltip without giving markers pointer events or blocking native seeking.
+`resolveActiveSeekTarget` implements that full hierarchy. It requires one seek bar and one non-volume slider outside the control-bar button group, then validates one each of the native track, track-before, track-after, and thumb structures. It accepts both the current release's direct seek-slider form and the source/development form with an extra wrapper because the final structural proof is unchanged. Ambiguity or a missing native layer fails closed. The renderer inserts exactly one owned layer directly before the validated native thumb layer, removes stale owned layers document-wide, and never modifies a native node.
 
-Markers will use subtle type colors, no permanent labels, and the native track height. Because the overlay lives inside the control bar, native control visibility automatically governs marker visibility. A `ResizeObserver`, `durationchange`, segment-result update, and DOM reconcile redraw it after layout or React remounts.
+The Phase 0 proposal to make the overlay `aria-hidden` was corrected during implementation: hiding it would also hide useful keyboard semantics. The layer is an accessible group, and every marker is a focusable `role="img"` with a type/time-range `aria-label`. Marker and layer pointer events remain disabled so native dragging/clicking passes through; one passive listener on the slider supplies a temporary hover tooltip, while focus has priority and supplies the same information. The owned layer has `z-index: 0` and native track height, is inserted below the thumb, and becomes `visibility: hidden` with Stremio's `overlayHidden-*` control state so invisible markers are not keyboard stops. Percent geometry uses only already-validated in-duration ranges; boundary clamping is rendering-only. The document reconciler and cached bundle reattach markers after control remount without refetching.
 
 ### 5.4 Player state and next episode
 
 The official player model includes `metaItem`, `seriesInfo`, and `nextVideo`; see [`Player.d.ts`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/core/types/models/Player.d.ts#L53-L65). It does not expose the live media clock, duration, or pause state; core state is for identity/bookkeeping, not a replacement for `PlaybackAdapter`.
 
-The current TheIntroDB plugin tries `window.services.core.transport.getState('player')`. Enhanced's own internal playback helper instead probes direct `core.getState('player')` after finding `window.core || window.services?.core` in [`PlaybackState.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/utils/PlaybackState.ts#L32-L57) and [`Helpers.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/utils/Helpers.ts#L165-L238). That helper is internal, is not in the scoped plugin API, and uses dynamic evaluation, so ShowSkip will not copy or depend on it. It also documents that the live core global may disappear during playback. Phase 2 may capture and bind a validated `getState` method as soon as one of the known shapes appears, without replacing host globals or using `eval`; reads remain bounded, shape-checked, and route-cross-checked. Ordinary deployed Stremio Web did not expose `window.services` during live browser inspection, so exact Enhanced availability remains mandatory live validation.
+The current TheIntroDB plugin tries `window.services.core.transport.getState('player')`. Enhanced's own internal playback helper instead probes direct `core.getState('player')` after finding `window.core || window.services?.core` in [`PlaybackState.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/utils/PlaybackState.ts#L32-L57) and [`Helpers.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/utils/Helpers.ts#L165-L238). That helper is internal, is not in the scoped plugin API, and uses dynamic evaluation, so ShowSkip does not copy or depend on it. It documents that the live core global may disappear during playback; Phase 2 therefore captures bound readers from the three known shapes without replacing host globals or using `eval`. Reads remain bounded, own-property shape-checked, and route-cross-checked. Ordinary deployed Stremio Web did not expose `window.services` during live browser inspection, so exact Enhanced reader availability remains a packaged-runtime question; the strict route fallback keeps Phase 2 usable while later reconciles continue trying to promote or invalidate it.
 
-Core seek dispatch alone is not media control: current Stremio Web performs both private `video.setTime(time)` and core `seek(...)` in [`Player.js`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/routes/Player/Player.js#L266-L269). ShowSkip will seek only through a verified playback adapter and let Stremio's own media events update UI/resume state; Phase 3 must verify that propagation in Enhanced.
+Core seek dispatch alone is not media control: current Stremio Web performs both private `video.setTime(time)` and core `seek(...)` in [`Player.js`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/routes/Player/Player.js#L266-L269). Any future Phase 3 seek must use a separately verified write-capable adapter and prove that Stremio UI/resume state follows it. Phase 2's adapter cannot seek.
 
 Stremio's next-video implementation is source-verified:
 
@@ -313,20 +321,23 @@ Chosen safety order for Phase 3:
 
 This path must be tested in Enhanced with a real multi-episode series before any automatic next behavior is enabled.
 
-## 6. Proposed architecture
+## 6. Implemented architecture and future boundaries
 
-The shipped file is a single bundle, but its source will retain six explicit responsibilities.
+The shipped file is a single bundle, but its source retains explicit responsibilities.
 
 | Component | Responsibility | Must not do |
 | --- | --- | --- |
-| `ContextDetector` | Parse routes, observe SPA mounts, resolve show/player/episode context | Fetch segments or render UI |
+| `ContextDetector` | Parse and snapshot route context | Fetch segments or inspect media |
+| `CoreStateReader` / `EpisodeIdentityProvider` | Capture bounded state readers and cross-check episode identity against the active route | Guess external IDs or trust contradictory state |
 | `ProfileStore` | Validate defaults, migrate, cache, and persist per-show profiles | Persist provider timestamps |
 | `SegmentProvider` / `TheIntroDBProvider` | Fetch, validate, and normalize episode segments | Touch player DOM or apply rules |
 | `ShowPageController` | Launcher, fully removable panel, profile editing | Control playback |
 | `TimelineRenderer` | Seek-bar overlay and hover tooltip | Decide skip behavior |
-| `PlayerController` | Playback-adapter lifecycle, buttons, auto-skip session state, next episode | Parse series-page UI |
+| `HtmlMediaAdapter` | Observe exactly one validated active HTML video through read-only snapshots/events | Seek or mutate any media property |
+| `DurationStabilizer` | Debounce exact durations and cap lookups per source/context | Fetch or cache provider data |
+| `PlayerController` | Coordinate identity, adapter, duration, provider, token checks, and timeline lifecycle | Implement skip/next behavior or parse series-page UI |
 
-`PlayerController` depends on a narrow `PlaybackAdapter`; Phase 2 implements `HtmlVideoAdapter`, while an unsupported implementation fails closed. This boundary leaves room for a future host-supported shell adapter without leaking player mechanics into rule logic. Shared helpers cover logging, abortable delays, owned DOM/style creation, validation, and teardown registration.
+`PlayerController` depends on a narrow playback-observation boundary. Phase 2 implements only `HtmlMediaAdapter`; an unsupported implementation fails closed. The class name intentionally differs from Phase 0's proposed `HtmlVideoAdapter` to emphasize media-capability observation rather than future control. Shared helpers cover logging, abortable delays, owned DOM/style creation, validation, and teardown registration.
 
 ### 6.1 Lifecycle state machine
 
@@ -368,31 +379,41 @@ The parsed `location.hash` is the authority for which controller may be active; 
     kind: "seriesDetail" | "player" | "other",
     type: "series" | null,
     metaId: "tt9288030" | null,
-    videoId: "tt9288030:1:1" | null
-  },
-  show: {
-    key: "imdb:tt9288030",
-    stremioId: "tt9288030",
-    imdbId: "tt9288030",
-    tmdbId: null
-  },
-  episode: {
-    key: "imdb:tt9288030:s1:e1",
+    videoId: "tt9288030:1:1" | null,
     season: 1,
     episode: 1,
-    stremioVideoId: "tt9288030:1:1"
+    signature: "<opaque parsed-route signature>"
+  },
+  identity: {
+    showKey: "imdb:tt9288030",
+    canonicalSeriesId: "tt9288030",
+    stremioVideoId: "tt9288030:1:1",
+    episodeKey: "imdb:tt9288030|s1|e1|tt9288030%3A1%3A1",
+    season: 1,
+    episode: 1,
+    imdbId: "tt9288030",
+    tmdbId: null,
+    tvdbId: null,
+    providerMediaId: { scheme: "imdb", value: "tt9288030" },
+    identitySource: "route" | "route+core"
   },
   playback: {
-    adapterKind: "htmlVideo" | null,
-    mediaElement: null,
-    actualDurationMs: null,
-    streamKey: null,
-    nextVideo: null
+    adapterKind: "htmlMedia" | null,
+    source: "https://..." | "",
+    currentTimeMs: null,
+    durationMs: null,
+    readyState: 0,
+    canSeek: false
+  },
+  lifetime: {
+    episodeToken: 1,
+    mediaToken: 2,
+    durationScopeKey: "episode-token|media-token|source-hash"
   }
 }
 ```
 
-Identity values from state and route must agree when both exist. A disagreement means the context is transitioning; defer rather than fetching for the wrong episode.
+The example combines controller fields for documentation; it is not a persisted object. Identity values from state and route must agree when both exist. A disagreement means the context is transitioning and synchronously invalidates old media/provider/timeline work. `episodeToken` changes with route identity and `mediaToken` changes with video/source lifetime, so late promises cannot mutate a newer context.
 
 ### 6.3 Persistent profile model
 
@@ -430,7 +451,7 @@ Allowed values are checked on every read. Missing or invalid fields fall back in
 }
 ```
 
-The top-level value and each profile must be plain JSON objects. Phase 1 will define tested profile-count and serialized-size ceilings; an over-limit value becomes read-only/in-memory for the session rather than being traversed without bound or silently overwritten.
+The top-level value and each profile must be plain JSON objects. Phase 1 defined and tested the concrete profile-count, property, depth, node, key-length, and serialized-size ceilings recorded in section 14.2; an over-limit value becomes read-only/in-memory for the session rather than being traversed without bound or silently overwritten.
 
 Closing the panel immediately removes the entire panel node and persists `panelOpen: false`. Reopening from the launcher persists `true`. When closed, no header, pill, summary, menu, backdrop, or panel fragment remains; the launcher is the only ShowSkip element on the series page.
 
@@ -449,51 +470,49 @@ The reserved `corrections` object supports future episode/stream timing adjustme
 }
 ```
 
-No correction UI or fingerprint matcher is planned in Phase 1.
+The `corrections` object remains a reserved Phase 0/1 schema hook. Phase 2 neither reads it into provider timing nor adds correction UI or a fingerprint matcher.
 
 ### 6.4 Normalized segment model
 
-The provider-neutral type vocabulary is extensible: `intro | recap | credits | preview | postCredits`. The current TheIntroDB provider maps only its four documented arrays one-to-one and never emits `postCredits`; that value is reserved for a future provider that truly distinguishes post-credit scenes. A future separate playback preference will require an explicit profile-schema migration rather than silently reusing `preview`.
+The Phase 2 provider-neutral vocabulary is exactly `recap | intro | credits | preview`. TheIntroDB's four documented arrays map one-to-one; `preview` remains distinct from credits, and no `postCredits` value exists in production. A future provider that truly distinguishes post-credit scenes would require an explicit normalized-type and profile-schema/UI migration rather than silently reusing `preview`.
 
 ```javascript
 {
-  episodeKey: "imdb:tt9288030:s1:e1",
-  provider: {
-    id: "theintrodb",
-    apiVersion: 3,
-    fetchedAt: "2026-08-20T00:00:00.000Z",
-    mediaId: { scheme: "imdb", value: "tt9288030" },
-    confidence: null
+  provider: "theintrodb",
+  providerVersion: "v3",
+  media: {
+    episodeKey: "imdb:tt9288030|s1|e1|tt9288030%3A1%3A1",
+    showKey: "imdb:tt9288030",
+    imdbId: "tt9288030",
+    tmdbId: 1396,
+    season: 1,
+    episode: 1
   },
-  timing: {
-    providerDurationHintMs: 2940000,
-    actualDurationMs: 2940000,
-    offsetMs: 0,
-    offsetSource: "none"
-  },
+  request: { durationMs: 2940000, authMode: "anonymous" },
+  fetchedAt: 1787200000000,
   segments: [
     {
-      id: "theintrodb:intro:0:62000:91000",
+      id: "intro:62000:91000",
       type: "intro",
-      providerStartMs: 62000,
-      providerEndMs: 91000,
-      effectiveStartMs: 62000,
-      effectiveEndMs: 91000,
+      startMs: 62000,
+      endMs: 91000,
+      endsAtMediaEnd: false,
+      provider: "theintrodb",
+      providerSource: "v3/media",
+      status: "accepted",
       confidence: null,
-      submissionCount: null,
-      source: "theintrodb"
     }
   ]
 }
 ```
 
-The current v3 OpenAPI response does not promise per-segment confidence, submission count, or the selected release duration. Undocumented confidence/submission-like response fields are ignored and the reserved normalized slots remain `null`; a future documented provider contract can populate them through explicit validation. `providerDurationHintMs` records the exact positive integer duration sent with the request, while `actualDurationMs` records the current video. Raw nullable provider boundaries are retained; effective times apply the documented null-boundary semantics, optional correction, and clamp to the actual duration.
+The current v3 OpenAPI response does not promise per-segment confidence, submission count, or selected release duration. Undocumented fields are ignored and `confidence` remains `null`. The bundle records the exact duration sent in its request metadata. Phase 2 does not retain raw response objects: documented null/sentinel semantics are validated first, then an accepted terminal credits/preview null is represented explicitly by `endsAtMediaEnd: true` with `endMs` equal to the live validated duration. No provider bundle or segment is passed to `ProfileStore`.
 
 Provider interface:
 
 ```javascript
-SegmentProvider.fetchEpisode(context, { signal })
-  // -> Promise<NormalizedSegmentBundle>
+SegmentProvider.fetchEpisode(identity, durationMs, signal)
+  // -> Promise<{ kind: "segments", bundle } | { kind: "empty" | "unavailable", reason }>
 ```
 
 Provider output validation rules:
@@ -507,10 +526,11 @@ Provider output validation rules:
 - for credits/preview, require `start_ms > 0`; allow end only when it is `null` or `> 0`, and require a finite end to exceed start;
 - reject all `end_ms === 0` values as no-segment sentinels; never treat zero as “to media end”;
 - for finite-ended raw segments, enforce the submission-rule duration bounds before correction: intro 5–200 seconds, recap 5–1,200 seconds, and credits/preview 5–1,800 seconds. Null-ended credits/preview are handled separately rather than assigned a fabricated finite provider interval;
-- only after acceptance and once `actualDurationMs` is finite and greater than zero, normalize intro/recap null starts to zero and resolve a credits/preview null end to actual duration for effective rendering/playback while retaining the raw null; until then a terminal segment is non-actionable;
-- drop or clamp effective ranges outside that positive actual duration and drop `end <= start` after correction;
+- only after acceptance and once `actualDurationMs` is finite and greater than zero, normalize intro/recap null starts to zero and resolve a credits/preview null end to actual duration while preserving terminal semantics in `endsAtMediaEnd`;
+- reject effective ranges outside the positive actual duration and reject `end <= start`; validation never clamps malformed data into validity;
+- remove exact duplicates while preserving overlapping or otherwise distinct records;
 - retain multiple segments per type;
-- sort by start, then end;
+- sort by start, then end, then type;
 - do not merge distinct regions merely because they share a type.
 
 These rules come from the live OpenAPI's named `components.schemas.SegmentTimestamp` and `SubmissionData` schemas plus the `/submit` business rules, read on the research date. The current official plugin's raw-positive-endpoint filter corroborates the need to reject sentinels before normalization at [`tidb.plugin.js` lines 857–868](https://github.com/TheIntroDB/stremio-enhanced-plugin/blob/d9e5e4d96ba430f85e456272d3099d03d8ac63cf/tidb.plugin.js#L857-L868). ShowSkip's per-type validation is intentionally stricter than that generic filter.
@@ -529,47 +549,47 @@ Panel content:
 - each row has `Auto`, `Button`, and `Off` choices;
 - one Next Episode row with `At credits`, `After credits`, `Button`, `Stremio default`, and `Never`;
 - one close control that removes the entire panel;
-- once Phase 2 uses provider data, small voluntary TheIntroDB attribution in the open panel footer, subject to the release-time Terms recheck above.
+- once at least one Phase 2 marker has actually rendered for that show during the current plugin session, small voluntary TheIntroDB attribution in the open panel footer, subject to the release-time Terms recheck above.
 
-There are no global behavior controls in Enhanced Settings during Phase 1.
+There are no global behavior controls in Enhanced Settings through Phase 2.
 
 ### 6.6 Timeline renderer
 
 The timeline is behavior-independent. If a valid bundle exists and duration is finite and greater than zero, all normalized regions render even when the matching profile behavior is `none`/Off.
 
-Type palette should be subtle and distinguishable in both dark and glass themes:
+The implemented type palette is subtle and distinguishable:
 
 - recap: warm amber;
 - intro: gold;
 - credits: cool blue;
 - preview: green.
 
-Each region is track-height, percent-positioned, rounded, semi-transparent, and unlabeled. Slider hover computes the pointed timestamp and shows a temporary tooltip such as `Intro · 01:02–01:31`. The tooltip is removed when controls, slider, episode, or plugin context disappears.
+Each region is native-track-height, percent-positioned, rounded, semi-transparent, and permanently unlabeled. Slider hover computes the pointed timestamp and shows a temporary tooltip such as `Intro · 01:02–01:31`; keyboard focus shows the same information and an accessible label. Tooltip/layer DOM is removed when the slider, episode, or plugin context disappears. Profile behavior is never an input to `TimelineRenderer`.
 
 ### 6.7 Playback rules
 
-Rule logic uses only this capability contract:
+#### Phase 2 observation contract
+
+Phase 2 uses this read-only contract:
 
 ```javascript
-PlaybackAdapter = {
-  kind,
+HtmlMediaAdapter = {
   capabilities: {
-    canObserveTime,
-    canObserveDuration,
-    clockPrecisionMs
+    canObserveTime: true,
+    canObserveDuration: true,
+    canSeek: false
   },
-  getTimeMs(),
-  getDurationMs(),
-  canSeekToMs(value),
-  seekToMs(value, { signal }), // Promise<{ mediaPositionReached: boolean }>
+  getSnapshot(), // connected, currentTimeMs, durationMs, readyState, source
   subscribe(listener),
   destroy()
 }
 ```
 
-The Phase 2 `HtmlVideoAdapter` wraps exactly one eligible connected, visible `<video>` beneath the active native player host. It listens to `loadedmetadata`, `durationchange`, `timeupdate`, `seeking`, `seeked`, `play`, `emptied`, and `ended` as needed and converts seconds to integer milliseconds at the boundary. It never controls an arbitrary document video. `canSeekToMs(value)` is target-specific: the finite target must be contained in a current `video.seekable` range; duration or `currentSrc` alone does not prove seekability. `seekToMs` aborts on adapter replacement/context change and resolves success only when `seeked` or a subsequent media-time sample reaches the target tolerance.
+`HtmlMediaAdapter` wraps exactly one eligible connected visible `<video>` beneath the active native player host. It observes `loadedmetadata`, `durationchange`, `loadstart`, `emptied`, `timeupdate`, `seeking`, `seeked`, `play`, and `ended`, converting readable seconds to integer milliseconds at the boundary. It never controls an arbitrary document video and exposes no `canSeekToMs` or `seekToMs` method. Provider/timeline orchestration reacts only to metadata, duration, source, video replacement, route changes, and teardown; observed time/seeking/play events do not trigger Phase 2 actions.
 
-That result proves only the media position. It does not prove Stremio's UI, resume offset, seek history, and library bookkeeping synchronized. Direct-seek propagation in packaged Enhanced is a Phase 3 release gate: skip buttons and auto rules remain disabled until it passes, while provider lookup and markers can operate with a positive duration and active seek-bar anchor. Automatic rules additionally require adequate clock precision. A missing capability disables only the features that need it, with current unsupported paths normally disabling all on-page features.
+#### Phase 3 design record (not implemented)
+
+Direct-seek propagation into Stremio UI, resume offset, seek history, and library bookkeeping remains a Phase 3 release gate. The rule semantics below preserve the Phase 0 plan, but no corresponding media-write, skip-button, auto-skip, next-episode, or keyboard-action code exists in the Phase 2 artifact.
 
 For each effective segment:
 
@@ -617,10 +637,10 @@ If `nextEpisode: atCredits` and `credits: auto` become eligible at the same time
 
 1. Abort provider fetches and delayed retries.
 2. Cancel animation frames and timeouts.
-3. Disconnect document, loader-script, overlay, and resize observers.
+3. Disconnect document, loader-script, and panel-resize observers.
 4. Remove `hashchange`, page lifecycle, window, slider, player-container, playback-adapter, and video listeners.
-5. Remove skip/next buttons, marker overlay, tooltip, panel, launcher, and owned styles.
-6. Clear in-memory provider results, current contexts, and session firing state.
+5. Remove marker overlay, tooltip, panel, launcher, and owned styles; Phase 2 has no skip/next buttons.
+6. Clear in-memory provider results, attribution-use flags, current contexts, and duration state.
 7. Delete `window.__showSkipPlugin` only if it still refers to this instance.
 
 No code may use untracked permanent intervals.
@@ -634,8 +654,10 @@ No code may use untracked permanent intervals.
 - No analytics, telemetry, account lookup, submission, or API-key collection in Phase 1–3.
 - No stream URL, title, show ID, or timestamp logging at normal info level. Debug logging, if later added, is local and opt-in.
 - Validate response status, JSON type, array sizes, timestamps, and duration before using data.
+- Bound provider bodies to 256 KiB and collections to 64 records per documented type before rendering or caching.
 - Abort stale requests so a prior episode cannot mutate the current player.
 - Never persist TheIntroDB timestamp responses.
+- Phase 2 contains no `currentTime` assignment, seek method, playback mutation, skip/next control, synthetic player keyboard action, API-key path, analytics, or telemetry.
 - Use `textContent` and created DOM nodes for dynamic labels; do not interpolate provider data into HTML.
 
 ## 9. Known fragility and mitigations
@@ -647,20 +669,24 @@ No code may use untracked permanent intervals.
 | Action row has no stable ID/data attribute | Live-verified | Append to structurally identified row; do not depend on localized Trailer/Share labels or child index |
 | React remounts unmanaged DOM | SPA behavior and current component structure | Stable owned attributes, duplicate guards, coalesced observer, body portal for panel |
 | Inactive route DOM remains mounted | Source-verified router retention and live detail→player check | Parsed hash is authoritative; route-scoped roots; tear down prior controller even while its host DOM stays connected |
-| Seek and volume share slider classes | Live-verified | Scope through player → control bar → seek bar before selecting slider |
+| Seek and volume share slider classes | Live-verified | Scope through player → control bar → seek bar; accept release/direct or source/dev wrapper form only after exact native layer proof |
 | Player implementation may not expose `<video>` | Source selection includes YouTube, Chromecast, external, and shell paths; live trailer produced iframe | Capability adapter; require a connected HTML video under the active Enhanced player for Phase 2; otherwise fail closed |
-| Core state is mistaken for a media clock/seek surface | Current player types and `Player.js` separate core bookkeeping from private video control | Use core only for validated identity/next state; clock and seek come from `PlaybackAdapter` |
+| Core state is mistaken for a media clock/seek surface | Current player types and `Player.js` separate core bookkeeping from private video control | Use core only for validated identity; Phase 2 time comes from `HtmlMediaAdapter`, and seek remains absent |
 | Duration starts invalid, changes, or jitters | HTML media behavior; live torrent began with unknown duration | Wait for finite positive duration and a 750 ms quiet window; exact-duration keys; maximum two distinct lookups per media-source/context token |
-| `window.services` may be unavailable during player | Ordinary web live check; Enhanced preload comments; official plugin polling | Capture only validated bound reads, use route fallback for identity, and capability-gate next actions |
+| `window.services` may be unavailable during player | Ordinary web live check; Enhanced preload comments; official plugin polling | Capture only validated bound reads; strict route fallback is repeatedly revalidated, and any later conflict clears work |
 | Core state shape changes | Internal host API, not part of scoped plugin API | Defensive shape guards, route cross-check, no guessed context |
 | First `getSetting` rejects | Enhanced controller source | Treat as empty, initialize with save, validate every subsequent read |
 | Disable does not invoke teardown | Enhanced loader source | Singleton cleanup, loader-node observer, page lifecycle cleanup, reload fallback |
 | API ID resolution can be inaccurate | TheIntroDB OpenAPI says TMDB is canonical and IMDb/TVDB mapping adds latency/risk | Prefer verified TMDB when available; otherwise IMDb; never label arbitrary Stremio numeric IDs as TMDB |
-| Release offsets differ | Product requirement and TheIntroDB `duration_ms` contract | Send actual duration, retain provider/actual/correction layers, reserve per-stream corrections |
-| Incorrect timestamps can skip content | Provider terms and community data | Conservative validation/tolerances; button defaults; no auto default; safe next fallback |
+| Release offsets differ | Product requirement and TheIntroDB `duration_ms` contract | Send the exact live rounded duration, isolate exact-duration bundles, and leave the correction hook deferred |
+| Incorrect timestamps could affect future actions | Provider terms and community data | Phase 2 is visual/read-only; conservative validation and button defaults remain future Phase 3 safeguards |
 | API/data terms change | Live service terms | Link attribution, session-only cache, re-review terms before release |
 
-## 10. Required live validation matrix
+## 10. Validation evidence and required live matrix
+
+Phase 2 has 61 passing dependency-free Node tests across the existing Phase 1/1.1 suite and `tests/showskip-phase2.test.cjs`. Public Stremio Web was inspected read-only on 2026-08-20: the current trailer player retained three route containers, with exactly one active player, one YouTube iframe, zero videos, one seek bar, and two generic sliders including volume. No ShowSkip marker layer appeared. The observed generated tokens (`player-container-wIELK`, `seek-bar-I7WeY`, `seek-bar-container-JGGTa`, and the seek/volume-shared `slider-container-nJz5F`) are recorded only as evidence, never hard-coded. This validates the need for route/player/seek structural scoping and confirms the trailer path fails closed. A separate local HTTP marker harness was blocked by the app browser's security policy and is not claimed as passed.
+
+No Phase 2 run inside packaged Stremio Enhanced is claimed. After the final source is installed and its SHA-256 matches the source artifact, the Phase 2 rows below—and the short exact checklist in `README.md`—remain manual acceptance work with a real built-in series stream.
 
 The following must be completed in installed Stremio Enhanced, not ordinary Stremio Web:
 
@@ -675,7 +701,8 @@ The following must be completed in installed Stremio Enhanced, not ordinary Stre
 | Show → episode streams → show → different show | 1/2 | Hash-gated controller despite retained route DOM; no stale/duplicate UI; correct profile and teardown |
 | Desktop, narrow window, fullscreen transitions | 1/2 | Launcher/panel/markers remain usable and do not cover native controls |
 | Packaged Enhanced runtime/build probe | 2 | Versions recorded; no `chrome.webview`; core shapes/cadence documented without assuming live globals persist |
-| Built-in Enhanced HTML series stream | 2/3 | Source inference is confirmed; exactly one active-player video is selected; direct seek reaches the target and Stremio UI/resume/history follow. This is a release gate—otherwise buttons/auto remain disabled; route/state agree |
+| Built-in Enhanced HTML series stream | 2 | Source inference is confirmed; exactly one active-player video is selected; route/state agree; one bounded exact-duration request produces only seek-bar markers and no playback mutation |
+| Direct-seek propagation | 3 | A future explicit seek reaches the target and Stremio UI/resume/history follow; this remains a Phase 3 release gate and has no Phase 2 implementation |
 | Multiple/stale videos, trailer, casting, or external-player path | 2 | Only the active route's connected media is eligible; unsupported medium or backed-out external route fails closed without a wrong fetch, marker, or playback action |
 | Episode change without reload | 2 | Old request aborted; old markers/listeners removed; new bundle rendered |
 | Provider envelope identity mismatch | 2 | Wrong type, any mismatching returned season/episode, or canonical TMDB mismatch is rejected and never cached/rendered; schema-valid omitted season/episode relies on the exact request/context token |
@@ -704,14 +731,14 @@ The following must be completed in installed Stremio Enhanced, not ordinary Stre
 6. **Authored metadata:** Confirm final `@author`, public source URL, and project license before release. `@updateUrl` remains `none` unless the user explicitly changes the remote-code policy.
 7. **Distribution model:** TheIntroDB timestamp terms permit client-side non-commercial use. Any commercial or bundled paid distribution requires a separate agreement.
 8. **`never` wording:** The proposed meaning disables ShowSkip next behavior but does not attempt to defeat native Stremio end-of-video behavior. Confirm if future product intent requires a more invasive native suppression mode.
-9. **Post-credit-safe endpoint:** TheIntroDB has no completeness/final-region safety flag, and a latest finite credits/preview boundary is insufficient. Current `afterCredits` can use only a valid terminal null end resolved against actual duration; any future broader criterion requires provider evidence and real multi-region validation.
-10. **Distinct post-credit data:** TheIntroDB v3 does not expose post-credit scenes separately. A future provider that does will need the reserved normalized type plus an explicit profile-schema/UI migration; ShowSkip will not infer it from `preview`.
+9. **Post-credit-safe endpoint:** TheIntroDB has no completeness/final-region safety flag, and a latest finite credits/preview boundary is insufficient. The proposed Phase 3 `afterCredits` behavior can use only a valid terminal null end resolved against actual duration; any future broader criterion requires provider evidence and real multi-region validation.
+10. **Distinct post-credit data:** TheIntroDB v3 does not expose post-credit scenes separately. A future provider that does will need a new normalized type plus an explicit profile-schema/UI migration; ShowSkip does not reserve or infer it from `preview` in production.
 
-None of these blocks Phase 1's per-show profile UI. Questions 1–5 block or constrain Phase 2/3 capabilities.
+None of these blocks Phase 1's per-show profile UI or the fail-closed Phase 2 implementation. Questions 1–5 remain packaged-runtime constraints and block broader support or Phase 3 playback actions until verified.
 
-## 12. Exact Phase 1–4 plan
+## 12. Exact Phase 1–4 plan and status
 
-### Phase 1 — per-show UI, storage, and lifecycle
+### Phase 1 — per-show UI, storage, and lifecycle (implemented)
 
 - Create the first self-contained `ShowSkip.plugin.js` with the verified metadata header.
 - Implement singleton boot/destroy, coalesced SPA reconciliation, route parsing, canonical show keys, and defensive profile storage/migration.
@@ -723,18 +750,18 @@ None of these blocks Phase 1's per-show profile UI. Questions 1–5 block or con
 - Add focused automated tests where practical plus a recorded manual matrix.
 - Commit only after Phase 1 acceptance criteria pass.
 
-### Phase 2 — episode context, provider, and timeline
+### Phase 2 — episode context, provider, and timeline (implemented; packaged manual gate pending)
 
 - Add the provider interface and independent TheIntroDB v3 implementation.
 - Resolve and cross-check player episode context; capability-gate unsupported identities.
 - Implement the playback-adapter contract; acquire only a connected HTML video under the active Enhanced player and fail closed for unsupported implementations.
-- Confirm the source-inferred Enhanced built-in HTMLVideo path with the configured local streaming backend and track media/source/duration changes.
+- Track media/source/duration changes through the read-only HTML adapter; confirm the source-inferred Enhanced built-in HTMLVideo path with the configured local streaming backend during the remaining packaged manual gate.
 - Normalize/validate segments, stabilize and cap duration-driven requests, use an abortable session cache, and respect 404/429/5xx behavior.
-- Add the voluntary panel attribution when provider timestamp data is first used, after rechecking the current destination and obligation.
+- Add the voluntary panel attribution after at least one provider marker actually renders for a show, using session-only state and the current terms-specified destination.
 - Render all valid markers on the seek bar regardless of profile behavior, including hover detail.
 - Validate control hiding/remount, duration changes, and same-page episode transitions.
 - Keep skip and next actions nonfunctional in this phase.
-- Commit after Phase 2 acceptance criteria pass.
+- Commit the completed implementation after automated/static checks, final install/hash verification, and documentation; report the packaged manual gate without claiming it was automated.
 
 ### Phase 3 — skip behavior and next episode
 
@@ -796,3 +823,48 @@ Concrete safety ceilings are 512 profiles, 512 KiB of serialized UTF-8 state, 51
 The 26-test dependency-free Node suite covers exact panel rows/options/selections, owned contrast declarations and palette ratios, route and key parsing, defaults, validation and migration, bounded traversal, inherited-value isolation, first-read retry, corrupt/over-limit recovery, serialized immutable writes, save failure, per-show independence, `panelOpen` ordering, stale-result protection, duplicate prevention, single-flight scheduler coalescing, and active-route DOM scoping. `node --check` and both PowerShell parser checks are part of the local workflow. The install/uninstall scripts were also exercised against an isolated temporary `APPDATA` tree, including hash-equal install, overwrite, settings preservation/reset, and unrelated-file preservation.
 
 On 2026-08-20, read-only validation against the live public Stremio Web series detail page confirmed one focused router chain and the expected unique `action-buttons-container-*` target. The actual plugin artifact was then exercised in a local Chromium DOM harness using that router structure: first defaults, full collapse, reopen and choice persistence, independent IMDb/non-IMDb profiles, retained-route navigation cleanup, player/home cleanup, revisit, and action-row remount all passed without duplicates or plugin errors. The user subsequently confirmed that Phase 1 loaded and rendered in the packaged Stremio Enhanced application; that run exposed unreadable row and unselected-option text caused by unsuitable host foreground variables. Phase 1.1 replaces critical panel colors with a scoped ShowSkip-owned palette and adds row/option and contrast assertions. The corrected artifact was verified in the Chromium harness, but still requires the user's packaged-Enhanced visual recheck for labels, all control states, alternate/narrow layouts, and the existing lifecycle cases. No claim of corrected packaged visual validation is made here.
+
+## 15. Phase 2 implementation record
+
+Phase 2 advances the standalone artifact to `0.2.0` without changing `state_v1`. It adds episode identity, read-only media observation, duration stabilization, one hardened provider, and behavior-independent native-timeline markers. Phase 1 choices remain visible and persistent but inert: the production file has no media write, skip/next button, automatic rule, next-episode transition, or synthetic player keyboard action.
+
+### 15.1 Episode, media, and stale-work lifecycle
+
+- `ContextDetector` recognizes strict eligible series-player routes separately from ineligible short trailer/player routes. `EpisodeIdentityProvider` keeps route parsing independent of both media observation and networking.
+- `CoreStateReader` captures bound reads from known current/retained core shapes. A ready state must agree with route meta, season, episode, and any present selected/library IDs. Loading state defers; contradiction invalidates route-only work; a later match promotes it. The active route signature is rechecked after reads.
+- Current provider eligibility is intentionally narrower than profile identity: only exact 7/8-digit IMDb IDs are emitted. No arbitrary Stremio ID becomes a TMDB/TVDB ID.
+- The active media resolver follows only the last route container through one visible player and video host to exactly one connected visible `<video>`. `HtmlMediaAdapter` reads snapshots/events and advertises `canSeek: false`; it exposes no playback mutation method.
+- Duration must round to a positive safe integer and remain unchanged for 750 ms. Episode, video, or source changes reset its scope; at most two distinct exact durations can issue per scope. Episode/media counters plus live route, video, source, and duration checks reject late identity/provider results.
+
+### 15.2 TheIntroDB provider and data handling
+
+- `TheIntroDBProvider` performs only direct anonymous GETs to `https://api.theintrodb.org/v3/media` with the verified media ID, positive season/episode, and exact rounded `duration_ms`. The production identity path currently supplies IMDb; URL construction also accepts TMDB/TVDB only when a future verified identity explicitly labels it.
+- A response must be a bounded plain TV envelope with a positive TMDB ID; returned season/episode must match when present, and a requested TMDB ID must match exactly. Each known collection is bounded to 64 items, each item must own both boundaries, and timestamps may not exceed 21,600,000 ms or the live duration.
+- Raw sentinels are classified before normalization. Intro/recap accept null/zero start only with a positive valid end; credits/preview require a positive start and may use only null—not zero—as media end. Finite per-type duration bounds apply. Malformed items reject the entire body; valid no-segment sentinels are ignored. Exact duplicates are removed, while overlaps and preview identity remain intact.
+- The 24-entry in-memory LRU and in-flight map use provider/auth, canonical episode, and exact duration identity. Validated 200 and explicit 404/legacy-204 empty results are cacheable. Cache entries remain usable after reliable daily exhaustion; all data disappears with plugin teardown/reload and never enters settings or files.
+- The provider allows two total attempts. Network/timeout/5xx and a numeric short rate reset may retry once through abortable backoff. Timeout remains active through body reading, the body is capped at 256 KiB, daily exhaustion requires exact response evidence, and deduplicated callers cancel independently. Context teardown aborts the underlying request when no consumer remains.
+
+### 15.3 Timeline, accessibility, remounts, and attribution
+
+- Seek discovery follows active route → player → control bar → seek bar → non-volume slider and proves the four native track/thumb structures. It tolerates the current release direct slider and source/development wrapper shape, but ambiguity, retained DOM, volume-only controls, or structure drift fails closed.
+- Every valid recap, intro, credits, and preview segment renders regardless of `Auto`/`Button`/`Off`. Percent geometry uses the live validated duration. The owned pointer-transparent layer is inserted immediately below the native thumb, and stale layers are removed without touching native nodes.
+- Markers use distinct amber/gold/blue/green colors, native track height, focus rings, `role="img"`, and type/time `aria-label`s. Hover or focus shows a temporary tooltip. Stremio's hidden-control state hides the layer with `visibility`, avoiding invisible keyboard stops while preserving accessible markers when controls are shown.
+- Control remounts reuse the already-valid bundle for the current exact duration. Episode, video, source, duration, route, or plugin teardown removes old marker/tooltip state before newer work can render.
+- A per-show in-memory flag is set only after at least one TheIntroDB marker renders. On a later open panel for that show it adds “Timestamp data by TheIntroDB” linked to the terms-specified `https://theintrodb.com`; it is absent until actual use and is never persisted. This is voluntary under the terms reviewed on 2026-08-20, which request attribution but do not require it by default.
+
+### 15.4 Verification, live gate, and evidence-backed deviations
+
+`node --check ShowSkip.plugin.js` and `node --test tests/*.test.cjs` pass; the combined dependency-free suite contains 61 tests. Phase 2 coverage includes eligible/ineligible routes, core match/conflict/loading/retained readers, media ambiguity/replacement/read-only behavior, duration jitter/source reset/two-key cap, exact provider URLs and cache separation, sentinel/envelope/range/body-size validation, timeout/abort/deduplication/retry/daily-limit behavior, seek-versus-volume structure, marker geometry/accessibility/focus/remount/cleanup, stale completions, and a production-source prohibition check for Phase 3 actions. The 26 Phase 1/1.1 regression tests remain in that total.
+
+Read-only current public-web inspection confirmed the release player/control/seek hierarchy, shared seek/volume slider class, four native layers, and the need for last-route scoping. A live trailer player had three retained route containers, one active player, one iframe, zero videos, one seek bar, two generic sliders including volume, and zero marker layers—an expected fail-closed result. The generated suffixes are not production selectors. A further local HTTP marker-harness run was blocked by the app browser's security policy and is not reported as passed.
+
+Phase finalization copies the exact finished artifact with `scripts/install-local.ps1` and records source/installed SHA-256 equality in the completion report. That installation check proves artifact identity, not player behavior. No packaged Enhanced Phase 2 playback validation is claimed; the README checklist remains required with a real built-in episode and local backend.
+
+Implemented deviations/refinements from the Phase 0 proposal are deliberate:
+
+- `HtmlVideoAdapter` became read-only `HtmlMediaAdapter`, with `canSeek: false` and no future-looking seek methods, so Phase 2 cannot accidentally control playback.
+- The proposed `aria-hidden` timeline was replaced by an accessible group of focusable markers; pointer transparency still preserves native seeking, and hidden controls use CSS visibility to remove focus stops.
+- Seek discovery supports both the observed release direct-slider DOM and the pinned source/development wrapper, but only after validating the same native track/thumb structure.
+- The runtime normalized vocabulary contains only the four TheIntroDB types. The richer Phase 0 timing/correction/post-credits model remains deferred rather than inventing unsupported provider meaning or persisting raw data.
+- Attribution is driven by actual rendered-marker use and remembered only per show for the current plugin session, rather than appearing merely because a provider request occurred.
+- Percent geometry plus document reconciliation replaces the proposed timeline `ResizeObserver`; no pixel geometry is cached, and a remounted slider receives a fresh owned layer from the valid session bundle.
