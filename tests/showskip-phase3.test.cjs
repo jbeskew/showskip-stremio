@@ -157,8 +157,8 @@ function seekHarness({ enabled = true, ranges = [[0, 100]], timeoutMs = 100 } = 
     };
 }
 
-test("production Phase 3 gate is a literal disabled capability", async () => {
-    assert.equal(PHASE3_PLAYBACK_ACTIONS_ENABLED, false);
+test("production v1 gate is enabled while adapters retain an explicit gate-off defense", async () => {
+    assert.equal(PHASE3_PLAYBACK_ACTIONS_ENABLED, true);
     const harness = seekHarness({ enabled: false });
     const result = await harness.adapter.seekToMs(20_000, harness.context, new AbortController().signal);
     assert.deepEqual(plain(result), { ok: false, reason: "gate-disabled", reachedMs: null });
@@ -495,11 +495,16 @@ test("next button requires credits, availability, mechanism gate, and failure bl
     assert.equal(observe(new PlaybackActionStateMachine({ actionsEnabled: true }), { positionMs: 85_000, nowMs: 0, segments: [credits], currentProfile: profile({ nextEpisode: "button" }), nextAvailable: false }).buttonAction, null);
 });
 
-test("NextEpisodeAdapter is unavailable in production shape and controlled transitions revalidate", async () => {
+test("NextEpisodeAdapter remains unavailable in the enabled production shape and controlled transitions revalidate", async () => {
     const context = Object.freeze({ episodeToken: 1 });
-    const unavailable = new NextEpisodeAdapter({ actionsEnabled: false });
-    assert.deepEqual(plain(unavailable.getAvailability(context)), { known: false, available: false, reason: "gate-disabled" });
-    assert.equal((await unavailable.advance(context)).reason, "gate-disabled");
+    const unavailable = new NextEpisodeAdapter({
+        actionsEnabled: PHASE3_PLAYBACK_ACTIONS_ENABLED,
+        validateContext: (candidate) => candidate === context,
+    });
+    assert.equal(unavailable.capabilities.canVerifyAvailability, false);
+    assert.equal(unavailable.capabilities.canAdvance, false);
+    assert.deepEqual(plain(unavailable.getAvailability(context)), { known: false, available: false, reason: "mechanism-unavailable" });
+    assert.equal((await unavailable.advance(context)).reason, "mechanism-unavailable");
 
     let live = true;
     let transitions = 0;
@@ -750,14 +755,14 @@ test("action renderer survives a control remount and moves cleanly to one replac
     renderer.destroy();
 });
 
-test("Phase 2 marker rendering remains behavior-independent with Phase 3 compiled gate-off", () => {
+test("Phase 2 marker rendering remains behavior-independent with production actions enabled", () => {
     const fixture = playerDom();
     const renderer = new TimelineRenderer(fixture.documentObject);
     const bundle = { segments: [segment("intro", 10_000, 20_000)] };
     assert.equal(renderer.render(bundle, 100_000, "episode-a"), 1);
     assert.equal(fixture.documentObject.querySelectorAll("[data-showskip-timeline-marker]").length, 1);
     const actions = new PlaybackActionStateMachine({ actionsEnabled: PHASE3_PLAYBACK_ACTIONS_ENABLED });
-    assert.equal(observe(actions, { positionMs: 15_000, nowMs: 0, segments: bundle.segments, currentProfile: profile({ intro: "button" }) }).buttonAction, null);
+    assert.equal(observe(actions, { positionMs: 15_000, nowMs: 0, segments: bundle.segments, currentProfile: profile({ intro: "none" }) }).buttonAction, null);
     assert.equal(fixture.documentObject.querySelectorAll("[data-showskip-timeline-marker]").length, 1);
 });
 
@@ -782,6 +787,10 @@ test("source has exactly one playback write, no guessed navigation, and gate is 
     const source = fs.readFileSync(path.join(__dirname, "..", "ShowSkip.plugin.js"), "utf8");
     assert.equal([...source.matchAll(/\.currentTime\s*=/gu)].length, 1);
     assert.doesNotMatch(source, /Player\s*\/\s*NextVideo|Shift\+N|KeyboardEvent|deepLinks|location\.hash\s*=/u);
-    assert.match(source, /const PHASE3_PLAYBACK_ACTIONS_ENABLED = false;/u);
+    assert.match(source, /const PHASE3_PLAYBACK_ACTIONS_ENABLED = true;/u);
     assert.doesNotMatch(source, /PHASE3_PLAYBACK_ACTIONS_ENABLED\s*[:=].*(?:getSetting|fetch|localStorage|process\.env)/u);
+    const wiringStart = source.indexOf("this.nextAdapter = options.nextAdapter || new NextEpisodeAdapter({");
+    const wiringEnd = source.indexOf("this.route = null;", wiringStart);
+    assert.ok(wiringStart > 0 && wiringEnd > wiringStart);
+    assert.doesNotMatch(source.slice(wiringStart, wiringEnd), /readAvailability|transition/u);
 });

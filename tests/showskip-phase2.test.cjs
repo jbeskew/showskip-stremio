@@ -1254,9 +1254,10 @@ test("PlayerController ignores a provider result after episode teardown", async 
     controller.destroy();
 });
 
-test("production source keeps the Phase 3 gate false and confines its sole media write to HtmlMediaAdapter", () => {
+test("production v1 enables Phase 3 actions and confines its sole media write to HtmlMediaAdapter", () => {
     const source = fs.readFileSync(path.join(__dirname, "..", "ShowSkip.plugin.js"), "utf8");
-    assert.match(source, /const PHASE3_PLAYBACK_ACTIONS_ENABLED = false;/u);
+    assert.match(source, /const PHASE3_PLAYBACK_ACTIONS_ENABLED = true;/u);
+    assert.match(source, /\* @version 1\.0\.0/u);
     const writes = [...source.matchAll(/\.currentTime\s*=/gu)];
     assert.equal(writes.length, 1);
     assert.ok(writes[0].index > source.indexOf("class HtmlMediaAdapter"));

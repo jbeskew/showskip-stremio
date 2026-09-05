@@ -63,13 +63,6 @@ const EXPECTED_PANEL_ROWS = Object.freeze([
     { field: "intro", label: "Intro", values: ["auto", "button", "none"], labels: ["Auto", "Button", "Off"], selected: "button" },
     { field: "credits", label: "Credits / Outro", values: ["auto", "button", "none"], labels: ["Auto", "Button", "Off"], selected: "button" },
     { field: "preview", label: "Preview", values: ["auto", "button", "none"], labels: ["Auto", "Button", "Off"], selected: "button" },
-    {
-        field: "nextEpisode",
-        label: "Next Episode",
-        values: ["atCredits", "afterCredits", "button", "stremio", "never"],
-        labels: ["At credits", "After credits", "Button", "Stremio default", "Never"],
-        selected: "stremio",
-    },
 ]);
 
 function createUiElement(tagName) {
@@ -138,8 +131,8 @@ function contrastRatio(first, second) {
     return (lighter + 0.05) / (darker + 0.05);
 }
 
-test("panel renders every required row and option label exactly once", () => {
-    assert.equal(PANEL_ROWS.length, 5);
+test("panel renders every supported segment row and option label exactly once", () => {
+    assert.equal(PANEL_ROWS.length, 4);
     assert.deepEqual(
         plain(PANEL_ROWS).map(({ field, label, values, labels }) => ({ field, label, values, labels })),
         EXPECTED_PANEL_ROWS.map(({ field, label, values, labels }) => ({ field, label, values, labels })),
@@ -173,7 +166,7 @@ test("panel renders every required row and option label exactly once", () => {
     });
 });
 
-test("panel choice rendering preserves non-default selected states", () => {
+test("panel choice rendering preserves non-default segment states and hides legacy next state", () => {
     const profile = {
         ...createDefaultProfile("imdb:tt0903747"),
         recap: "auto",
@@ -182,8 +175,8 @@ test("panel choice rendering preserves non-default selected states", () => {
         preview: "auto",
         nextEpisode: "never",
     };
-    const expectedValues = ["auto", "none", "button", "auto", "never"];
-    const expectedLabels = ["Auto", "Off", "Button", "Auto", "Never"];
+    const expectedValues = ["auto", "none", "button", "auto"];
+    const expectedLabels = ["Auto", "Off", "Button", "Auto"];
     const rendered = renderChoiceRows(profile);
 
     assert.deepEqual(rendered.map((fieldset) => {

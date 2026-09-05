@@ -1,8 +1,8 @@
 /**
  * @name ShowSkip
- * @description Per-show segment skipping and next-episode rules for Stremio Enhanced.
+ * @description Per-show intro, recap, credits, and preview skipping for Stremio Enhanced.
  * @updateUrl none
- * @version 0.3.0
+ * @version 1.0.0
  * @author ShowSkip contributors
  */
 
@@ -19,9 +19,9 @@
     const THEINTRODB_ENDPOINT = "https://api.theintrodb.org/v3/media";
     const THEINTRODB_ATTRIBUTION_URL = "https://theintrodb.com";
 
-    // PHASE 3 RELEASE GATE: keep false until the packaged Enhanced validation
-    // checklist in README.md has passed and the activation change is reviewed.
-    const PHASE3_PLAYBACK_ACTIONS_ENABLED = false;
+    // Final local v1 production capability. Keep this literal internal so playback
+    // actions cannot be enabled or disabled by settings, page state, or remote data.
+    const PHASE3_PLAYBACK_ACTIONS_ENABLED = true;
 
     const LIMITS = Object.freeze({
         maxProfiles: 512,
@@ -53,12 +53,6 @@
         Object.freeze({ field: "intro", label: "Intro", values: SEGMENT_VALUES, labels: ["Auto", "Button", "Off"] }),
         Object.freeze({ field: "credits", label: "Credits / Outro", values: SEGMENT_VALUES, labels: ["Auto", "Button", "Off"] }),
         Object.freeze({ field: "preview", label: "Preview", values: SEGMENT_VALUES, labels: ["Auto", "Button", "Off"] }),
-        Object.freeze({
-            field: "nextEpisode",
-            label: "Next Episode",
-            values: NEXT_VALUES,
-            labels: ["At credits", "After credits", "Button", "Stremio default", "Never"],
-        }),
     ]);
 
     const PANEL_PALETTE = Object.freeze({
@@ -4266,7 +4260,7 @@
             const note = this.panel.querySelector("[data-showskip-note]");
             if (note) {
                 const message = this.store.getStatus().mode === "writable"
-                    ? "Playback rules are saved for this show. The current safety gate keeps playback actions disabled."
+                    ? "Segment rules are saved for this show. Next-episode behavior remains managed by Stremio."
                     : "Changes are temporary because Enhanced settings are unavailable this session.";
                 if (note.textContent !== message) {
                     note.textContent = message;
