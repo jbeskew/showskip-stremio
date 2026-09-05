@@ -2,7 +2,7 @@
  * @name ShowSkip
  * @description Per-show segment skipping and next-episode rules for Stremio Enhanced.
  * @updateUrl none
- * @version 0.2.0
+ * @version 0.3.0
  * @author ShowSkip contributors
  */
 
@@ -18,6 +18,10 @@
     const PROFILE_VERSION = 1;
     const THEINTRODB_ENDPOINT = "https://api.theintrodb.org/v3/media";
     const THEINTRODB_ATTRIBUTION_URL = "https://theintrodb.com";
+
+    // PHASE 3 RELEASE GATE: keep false until the packaged Enhanced validation
+    // checklist in README.md has passed and the activation change is reviewed.
+    const PHASE3_PLAYBACK_ACTIONS_ENABLED = false;
 
     const LIMITS = Object.freeze({
         maxProfiles: 512,
@@ -94,6 +98,22 @@
         credits: Object.freeze({ minimum: 5_000, maximum: 1_800_000 }),
         preview: Object.freeze({ minimum: 5_000, maximum: 1_800_000 }),
     });
+    const PLAYBACK_ACTION_LIMITS = Object.freeze({
+        seekTimeoutMs: 1_500,
+        seekableToleranceMs: 500,
+        seekResultToleranceMs: 750,
+        minimumForwardSeekMs: 250,
+        segmentStartGraceMs: 1_000,
+        segmentEndToleranceMs: 750,
+        naturalForwardSlackMs: 1_500,
+        maxNaturalWallDeltaMs: 2_500,
+        manualSeekSuppressionMs: 1_500,
+        showSkipCompletionSuppressionMs: 500,
+        backwardRearmMs: 10_000,
+        mediaEndToleranceMs: 1_000,
+    });
+    const ACTION_BUTTON_ROOT_SELECTOR = "[data-showskip-playback-action-root]";
+    const SEGMENT_ACTION_ORDER = Object.freeze(["recap", "intro", "credits", "preview"]);
 
     function isPlainObject(value) {
         if (value === null || typeof value !== "object" || Object.prototype.toString.call(value) !== "[object Object]") {
@@ -1275,17 +1295,85 @@
         return isPositiveSafeInteger(durationMs) ? durationMs : null;
     }
 
+    function seekResult(ok, reason, reachedMs = null) {
+        return Object.freeze({ ok, reason, reachedMs });
+    }
+
+    function resolveSeekableTargetMs(videoElement, requestedMs, durationMs, toleranceMs) {
+        if (!videoElement || !Number.isFinite(requestedMs) || requestedMs < 0
+            || !isPositiveSafeInteger(durationMs) || requestedMs > durationMs) {
+            return null;
+        }
+        let ranges;
+        try {
+            ranges = videoElement.seekable;
+        } catch (_error) {
+            return null;
+        }
+        if (!ranges || !Number.isSafeInteger(ranges.length) || ranges.length <= 0
+            || typeof ranges.start !== "function" || typeof ranges.end !== "function") {
+            return null;
+        }
+        for (let index = 0; index < ranges.length; index += 1) {
+            let startSeconds;
+            let endSeconds;
+            try {
+                startSeconds = ranges.start(index);
+                endSeconds = ranges.end(index);
+            } catch (_error) {
+                return null;
+            }
+            if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds)
+                || startSeconds < 0 || endSeconds < startSeconds) {
+                return null;
+            }
+            const startMs = Math.round(startSeconds * 1000);
+            const endMs = Math.min(durationMs, Math.round(endSeconds * 1000));
+            if (requestedMs >= startMs - toleranceMs && requestedMs <= endMs + toleranceMs) {
+                return Math.min(endMs, Math.max(startMs, Math.round(requestedMs)));
+            }
+        }
+        return null;
+    }
+
     class HtmlMediaAdapter {
-        constructor(windowObject, videoElement) {
+        constructor(windowObject, videoElement, options = {}) {
             this.window = windowObject;
             this.video = videoElement;
             this.listeners = new Set();
             this.eventListeners = [];
             this.destroyed = false;
+            this.actionsEnabled = options.actionsEnabled === true;
+            this.resolveActiveVideo = typeof options.resolveActiveVideo === "function"
+                ? options.resolveActiveVideo
+                : () => null;
+            this.validateContext = typeof options.validateContext === "function"
+                ? options.validateContext
+                : () => false;
+            this.onShowSkipSeekStart = typeof options.onShowSkipSeekStart === "function"
+                ? options.onShowSkipSeekStart
+                : () => undefined;
+            this.onShowSkipSeekFinish = typeof options.onShowSkipSeekFinish === "function"
+                ? options.onShowSkipSeekFinish
+                : () => undefined;
+            this.setTimeout = options.setTimeout
+                || (windowObject && typeof windowObject.setTimeout === "function"
+                    ? windowObject.setTimeout.bind(windowObject)
+                    : globalThis.setTimeout);
+            this.clearTimeout = options.clearTimeout
+                || (windowObject && typeof windowObject.clearTimeout === "function"
+                    ? windowObject.clearTimeout.bind(windowObject)
+                    : globalThis.clearTimeout);
+            this.seekTimeoutMs = options.seekTimeoutMs || PLAYBACK_ACTION_LIMITS.seekTimeoutMs;
+            this.seekableToleranceMs = options.seekableToleranceMs || PLAYBACK_ACTION_LIMITS.seekableToleranceMs;
+            this.seekResultToleranceMs = options.seekResultToleranceMs || PLAYBACK_ACTION_LIMITS.seekResultToleranceMs;
+            this.minimumForwardSeekMs = options.minimumForwardSeekMs
+                || PLAYBACK_ACTION_LIMITS.minimumForwardSeekMs;
+            this.pendingSeek = null;
             this.capabilities = Object.freeze({
                 canObserveTime: true,
                 canObserveDuration: true,
-                canSeek: false,
+                canSeek: this.actionsEnabled,
             });
             for (const type of [
                 "loadedmetadata",
@@ -1296,6 +1384,9 @@
                 "seeking",
                 "seeked",
                 "play",
+                "playing",
+                "pause",
+                "ratechange",
                 "ended",
             ]) {
                 const handler = () => this._emit(type);
@@ -1306,19 +1397,47 @@
 
         getSnapshot() {
             if (this.destroyed || !this.video || this.video.isConnected === false) {
-                return Object.freeze({ connected: false, currentTimeMs: null, durationMs: null, readyState: 0, source: "" });
+                return Object.freeze({
+                    connected: false,
+                    currentTimeMs: null,
+                    durationMs: null,
+                    readyState: 0,
+                    source: "",
+                    paused: null,
+                    seeking: null,
+                    ended: null,
+                    playbackRate: null,
+                });
             }
             let currentTime;
             let duration;
             let readyState;
             let source;
+            let paused;
+            let seeking;
+            let ended;
+            let playbackRate;
             try {
                 currentTime = this.video.currentTime;
                 duration = this.video.duration;
                 readyState = this.video.readyState;
                 source = this.video.currentSrc || this.video.src || "";
+                paused = this.video.paused;
+                seeking = this.video.seeking;
+                ended = this.video.ended;
+                playbackRate = this.video.playbackRate;
             } catch (_error) {
-                return Object.freeze({ connected: false, currentTimeMs: null, durationMs: null, readyState: 0, source: "" });
+                return Object.freeze({
+                    connected: false,
+                    currentTimeMs: null,
+                    durationMs: null,
+                    readyState: 0,
+                    source: "",
+                    paused: null,
+                    seeking: null,
+                    ended: null,
+                    playbackRate: null,
+                });
             }
             const currentTimeMs = typeof currentTime === "number" && Number.isFinite(currentTime) && currentTime >= 0
                 ? Math.round(currentTime * 1000)
@@ -1329,6 +1448,128 @@
                 durationMs: normalizeDurationMs(duration),
                 readyState: Number.isFinite(readyState) ? readyState : 0,
                 source: typeof source === "string" ? source : "",
+                paused: typeof paused === "boolean" ? paused : null,
+                seeking: typeof seeking === "boolean" ? seeking : null,
+                ended: typeof ended === "boolean" ? ended : null,
+                playbackRate: typeof playbackRate === "number" && Number.isFinite(playbackRate) && playbackRate > 0
+                    ? playbackRate
+                    : null,
+            });
+        }
+
+        async seekToMs(requestedMs, context, signal) {
+            if (!this.actionsEnabled || !this.capabilities.canSeek) {
+                return seekResult(false, "gate-disabled");
+            }
+            if (this.destroyed || this.pendingSeek) {
+                return seekResult(false, this.destroyed ? "adapter-destroyed" : "seek-pending");
+            }
+            if (!context || !this._contextIsLive(context)) {
+                return seekResult(false, "stale-context");
+            }
+            const snapshot = this.getSnapshot();
+            if (!snapshot.connected || snapshot.source !== context.source
+                || snapshot.durationMs !== context.durationMs || !isPositiveSafeInteger(snapshot.durationMs)) {
+                return seekResult(false, "invalid-media");
+            }
+            if (snapshot.currentTimeMs === null || !Number.isFinite(requestedMs)
+                || requestedMs < snapshot.currentTimeMs + this.minimumForwardSeekMs) {
+                return seekResult(false, "target-not-forward");
+            }
+            const targetMs = resolveSeekableTargetMs(
+                this.video,
+                requestedMs,
+                snapshot.durationMs,
+                this.seekableToleranceMs,
+            );
+            if (targetMs === null) {
+                return seekResult(false, "target-not-seekable");
+            }
+            if (signal && signal.aborted) {
+                return seekResult(false, "aborted");
+            }
+
+            return new Promise((resolve) => {
+                let settled = false;
+                let timeout = null;
+                const observed = [];
+                const finish = (result) => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    if (timeout !== null) {
+                        this.clearTimeout(timeout);
+                    }
+                    for (const { type, handler } of observed) {
+                        this.video.removeEventListener(type, handler);
+                    }
+                    if (signal) {
+                        signal.removeEventListener("abort", onAbort);
+                    }
+                    if (this.pendingSeek === pending) {
+                        this.pendingSeek = null;
+                    }
+                    try {
+                        this.onShowSkipSeekFinish(context, result);
+                    } catch (_error) {
+                        // An observer cannot change the adapter result.
+                    }
+                    resolve(result);
+                };
+                const validateProgress = (eventType) => {
+                    if (eventType === "loadstart" || eventType === "emptied" || eventType === "durationchange") {
+                        finish(seekResult(false, "media-invalidated"));
+                        return;
+                    }
+                    if (!this._contextIsLive(context)) {
+                        finish(seekResult(false, "stale-context"));
+                        return;
+                    }
+                    const current = this.getSnapshot();
+                    if (!current.connected || current.source !== context.source
+                        || current.durationMs !== context.durationMs) {
+                        finish(seekResult(false, "stale-media"));
+                        return;
+                    }
+                    if (current.currentTimeMs !== null
+                        && Math.abs(current.currentTimeMs - targetMs) <= this.seekResultToleranceMs) {
+                        finish(seekResult(true, "reached", current.currentTimeMs));
+                    } else if (eventType === "seeked") {
+                        finish(seekResult(false, "position-mismatch", current.currentTimeMs));
+                    }
+                };
+                const onAbort = () => finish(seekResult(false, "aborted"));
+                const pending = Object.freeze({
+                    context,
+                    targetMs,
+                    abort: () => finish(seekResult(false, "adapter-destroyed")),
+                });
+                this.pendingSeek = pending;
+
+                for (const type of ["seeked", "timeupdate", "loadstart", "emptied", "durationchange"]) {
+                    const handler = () => validateProgress(type);
+                    this.video.addEventListener(type, handler);
+                    observed.push({ type, handler });
+                }
+                if (signal) {
+                    signal.addEventListener("abort", onAbort, { once: true });
+                }
+                timeout = this.setTimeout(
+                    () => finish(seekResult(false, "timeout", this.getSnapshot().currentTimeMs)),
+                    this.seekTimeoutMs,
+                );
+                try {
+                    this.onShowSkipSeekStart(context, targetMs);
+                    if (!this._contextIsLive(context)) {
+                        finish(seekResult(false, "stale-context"));
+                        return;
+                    }
+                    // The sole production playback-position write is intentionally confined here.
+                    this.video.currentTime = targetMs / 1000;
+                } catch (_error) {
+                    finish(seekResult(false, "write-failed"));
+                }
             });
         }
 
@@ -1345,11 +1586,25 @@
                 return;
             }
             this.destroyed = true;
+            if (this.pendingSeek && typeof this.pendingSeek.abort === "function") {
+                this.pendingSeek.abort();
+            }
             for (const { type, handler } of this.eventListeners) {
                 this.video.removeEventListener(type, handler);
             }
             this.eventListeners = [];
             this.listeners.clear();
+        }
+
+        _contextIsLive(context) {
+            if (this.destroyed || !this.video || this.video.isConnected === false) {
+                return false;
+            }
+            try {
+                return this.resolveActiveVideo() === this.video && this.validateContext(context) === true;
+            } catch (_error) {
+                return false;
+            }
         }
 
         _emit(type) {
@@ -1359,6 +1614,517 @@
                     listener({ type, snapshot });
                 } catch (_error) {
                     // One observer must not break media observation for the plugin.
+                }
+            }
+        }
+    }
+
+    function nextAvailability(known, available, reason) {
+        return Object.freeze({ known, available, reason });
+    }
+
+    class NextEpisodeAdapter {
+        constructor(options = {}) {
+            this.actionsEnabled = options.actionsEnabled === true;
+            this.validateContext = typeof options.validateContext === "function"
+                ? options.validateContext
+                : () => false;
+            this.readAvailability = typeof options.readAvailability === "function"
+                ? options.readAvailability
+                : null;
+            this.transition = typeof options.transition === "function" ? options.transition : null;
+            this.capabilities = Object.freeze({
+                canVerifyAvailability: this.actionsEnabled && this.readAvailability !== null,
+                canAdvance: this.actionsEnabled && this.readAvailability !== null && this.transition !== null,
+            });
+        }
+
+        getAvailability(context) {
+            if (!this.actionsEnabled) {
+                return nextAvailability(false, false, "gate-disabled");
+            }
+            if (!this.capabilities.canVerifyAvailability || !this._contextIsLive(context)) {
+                return nextAvailability(false, false, "mechanism-unavailable");
+            }
+            try {
+                const result = this.readAvailability(context);
+                return isPlainObject(result) && ownValue(result, "known") === true
+                    && typeof ownValue(result, "available") === "boolean"
+                    ? nextAvailability(true, result.available, result.available ? "available" : "no-next-episode")
+                    : nextAvailability(false, false, "unverified-availability");
+            } catch (_error) {
+                return nextAvailability(false, false, "availability-failed");
+            }
+        }
+
+        async advance(context, signal) {
+            if (!this.actionsEnabled) {
+                return Object.freeze({ ok: false, reason: "gate-disabled" });
+            }
+            if (!this.capabilities.canAdvance || !this._contextIsLive(context)) {
+                return Object.freeze({ ok: false, reason: "mechanism-unavailable" });
+            }
+            const availability = this.getAvailability(context);
+            if (!availability.known || !availability.available) {
+                return Object.freeze({ ok: false, reason: availability.reason });
+            }
+            if (signal && signal.aborted) {
+                return Object.freeze({ ok: false, reason: "aborted" });
+            }
+            try {
+                if (!this._contextIsLive(context)) {
+                    return Object.freeze({ ok: false, reason: "stale-context" });
+                }
+                const result = await this.transition(context, signal);
+                if (signal && signal.aborted) {
+                    return Object.freeze({ ok: false, reason: "aborted" });
+                }
+                if (!this._contextIsLive(context)) {
+                    return Object.freeze({ ok: false, reason: "stale-context" });
+                }
+                return result === true || (isPlainObject(result) && ownValue(result, "ok") === true)
+                    ? Object.freeze({ ok: true, reason: "transition-requested" })
+                    : Object.freeze({ ok: false, reason: "transition-failed" });
+            } catch (_error) {
+                return Object.freeze({
+                    ok: false,
+                    reason: signal && signal.aborted ? "aborted" : "transition-failed",
+                });
+            }
+        }
+
+        _contextIsLive(context) {
+            try {
+                return Boolean(context) && this.validateContext(context) === true;
+            } catch (_error) {
+                return false;
+            }
+        }
+    }
+
+    function actionResult(automaticAction = null, buttonAction = null, naturalForward = false) {
+        return Object.freeze({ automaticAction, buttonAction, naturalForward });
+    }
+
+    function segmentActionLabel(type) {
+        return ({
+            recap: "Skip Recap",
+            intro: "Skip Intro",
+            credits: "Skip Credits",
+            preview: "Skip Preview",
+        })[type] || "Skip Segment";
+    }
+
+    function compareSegmentActions(first, second) {
+        if (first.endMs !== second.endMs) {
+            return first.endMs - second.endMs;
+        }
+        const firstType = SEGMENT_ACTION_ORDER.indexOf(first.type);
+        const secondType = SEGMENT_ACTION_ORDER.indexOf(second.type);
+        if (firstType !== secondType) {
+            return firstType - secondType;
+        }
+        return String(first.id).localeCompare(String(second.id));
+    }
+
+    function validActionSegments(segments, durationMs) {
+        return Array.isArray(segments) && isPositiveSafeInteger(durationMs)
+            ? segments.filter((segment) => isPlainObject(segment)
+                && PROVIDER_TYPES.includes(segment.type)
+                && typeof segment.id === "string" && segment.id.length > 0
+                && Number.isSafeInteger(segment.startMs) && segment.startMs >= 0
+                && Number.isSafeInteger(segment.endMs) && segment.endMs > segment.startMs
+                && segment.endMs <= durationMs)
+            : [];
+    }
+
+    class PlaybackActionStateMachine {
+        constructor(options = {}) {
+            this.actionsEnabled = options.actionsEnabled === true;
+            this.limits = options.limits || PLAYBACK_ACTION_LIMITS;
+            this.reset();
+        }
+
+        reset(sessionKey = null) {
+            this.sessionKey = sessionKey;
+            this.firedSegmentIds = new Set();
+            this.pendingSegmentIds = new Set();
+            this.blockedSegmentIds = new Set();
+            this.previousPositionMs = null;
+            this.previousWallMs = null;
+            this.initialPositionMs = null;
+            this.nativeSeeking = false;
+            this.showSkipSeek = null;
+            this.suppressUntilWallMs = 0;
+            this.lastNaturalForward = false;
+            this.nextPending = false;
+            this.nextFired = false;
+            this.nextBlocked = false;
+        }
+
+        observe(input) {
+            if (!this.actionsEnabled || !input || typeof input.sessionKey !== "string") {
+                return actionResult();
+            }
+            if (input.sessionKey !== this.sessionKey) {
+                this.reset(input.sessionKey);
+            }
+            const positionMs = input.positionMs;
+            const durationMs = input.durationMs;
+            const nowMs = input.nowMs;
+            const eventType = typeof input.eventType === "string" ? input.eventType : "sample";
+            if (!Number.isSafeInteger(positionMs) || positionMs < 0
+                || !isPositiveSafeInteger(durationMs) || positionMs > durationMs
+                || !Number.isFinite(nowMs)) {
+                return actionResult();
+            }
+            const segments = validActionSegments(input.segments, durationMs);
+            const profile = isPlainObject(input.profile) ? input.profile : DEFAULT_PROFILE_VALUES;
+            if (this.initialPositionMs === null) {
+                this.initialPositionMs = positionMs;
+            }
+
+            for (const segment of segments) {
+                if (this.blockedSegmentIds.has(segment.id)
+                    && (positionMs < segment.startMs || positionMs >= segment.endMs)) {
+                    this.blockedSegmentIds.delete(segment.id);
+                }
+            }
+
+            const previousPositionMs = this.previousPositionMs;
+            const previousWallMs = this.previousWallMs;
+            const mediaDeltaMs = previousPositionMs === null ? null : positionMs - previousPositionMs;
+            const wallDeltaMs = previousWallMs === null ? null : Math.max(0, nowMs - previousWallMs);
+            const showSkipSeeking = this.showSkipSeek !== null;
+            const playbackRate = typeof input.playbackRate === "number" && Number.isFinite(input.playbackRate)
+                && input.playbackRate > 0
+                ? input.playbackRate
+                : 1;
+            const nativeSeekEvent = eventType === "seeking" || eventType === "seeked";
+            const implausibleForward = mediaDeltaMs !== null && wallDeltaMs !== null
+                && mediaDeltaMs > (wallDeltaMs * playbackRate) + this.limits.naturalForwardSlackMs;
+            const substantialBackward = mediaDeltaMs !== null && mediaDeltaMs <= -this.limits.backwardRearmMs;
+            const userDiscontinuity = !showSkipSeeking
+                && (nativeSeekEvent || implausibleForward || substantialBackward);
+
+            if (eventType === "seeking" && !showSkipSeeking) {
+                this.nativeSeeking = true;
+            }
+            if (userDiscontinuity) {
+                this.suppressUntilWallMs = Math.max(
+                    this.suppressUntilWallMs,
+                    nowMs + this.limits.manualSeekSuppressionMs,
+                );
+            }
+            if (substantialBackward && !showSkipSeeking && previousPositionMs !== null) {
+                for (const segment of segments) {
+                    if (this.firedSegmentIds.has(segment.id)
+                        && previousPositionMs >= segment.endMs - this.limits.segmentEndToleranceMs
+                        && positionMs <= segment.startMs + this.limits.segmentStartGraceMs) {
+                        this.firedSegmentIds.delete(segment.id);
+                        this.blockedSegmentIds.delete(segment.id);
+                    }
+                }
+                if (positionMs <= this.limits.segmentStartGraceMs) {
+                    this.nextFired = false;
+                    this.nextBlocked = false;
+                }
+            }
+
+            const naturalForward = previousPositionMs !== null && previousWallMs !== null
+                && eventType === "timeupdate"
+                && mediaDeltaMs > 0
+                && wallDeltaMs > 0 && wallDeltaMs <= this.limits.maxNaturalWallDeltaMs
+                && mediaDeltaMs <= (wallDeltaMs * playbackRate) + this.limits.naturalForwardSlackMs
+                && !this.nativeSeeking && !nativeSeekEvent && !showSkipSeeking
+                && input.paused !== true && input.seeking !== true && input.ended !== true
+                && nowMs >= this.suppressUntilWallMs;
+            const naturalEntries = naturalForward
+                ? segments.filter((segment) => this._isNaturalEntry(segment, previousPositionMs, positionMs))
+                : [];
+            const nextAvailable = input.nextAvailable === true;
+            let automaticAction = null;
+
+            if (!this.nextPending && !this.nextFired && !this.nextBlocked && nextAvailable) {
+                if (ownValue(profile, "nextEpisode") === "atCredits") {
+                    const credits = naturalEntries.filter((segment) => segment.type === "credits")
+                        .sort(compareSegmentActions)[0];
+                    if (credits) {
+                        automaticAction = Object.freeze({
+                            kind: "next",
+                            mode: "atCredits",
+                            id: `next:atCredits:${credits.id}`,
+                            segmentId: credits.id,
+                            label: "Next Episode",
+                        });
+                    }
+                } else if (ownValue(profile, "nextEpisode") === "afterCredits"
+                    && eventType === "ended"
+                    && input.ended === true
+                    && positionMs >= durationMs - this.limits.mediaEndToleranceMs
+                    && (naturalForward || this.lastNaturalForward)) {
+                    const terminalCredits = segments.find((segment) => segment.type === "credits"
+                        && segment.endsAtMediaEnd === true && segment.endMs === durationMs);
+                    if (terminalCredits) {
+                        automaticAction = Object.freeze({
+                            kind: "next",
+                            mode: "afterCredits",
+                            id: `next:afterCredits:${terminalCredits.id}`,
+                            segmentId: terminalCredits.id,
+                            label: "Next Episode",
+                        });
+                    }
+                }
+            }
+
+            if (!automaticAction) {
+                const automaticSegments = naturalEntries
+                    .filter((segment) => ownValue(profile, segment.type) === "auto"
+                        && !this.firedSegmentIds.has(segment.id)
+                        && !this.pendingSegmentIds.has(segment.id)
+                        && !this.blockedSegmentIds.has(segment.id))
+                    .sort(compareSegmentActions);
+                const segment = automaticSegments[0];
+                if (segment) {
+                    automaticAction = Object.freeze({
+                        kind: "segment",
+                        mode: "auto",
+                        id: segment.id,
+                        segmentId: segment.id,
+                        segmentType: segment.type,
+                        targetMs: segment.endMs,
+                        label: segmentActionLabel(segment.type),
+                    });
+                }
+            }
+
+            const insideSegments = segments.filter((segment) => positionMs >= segment.startMs
+                && positionMs < segment.endMs - this.limits.segmentEndToleranceMs);
+            let buttonAction = null;
+            if (!this.nativeSeeking && input.seeking !== true
+                && !this.nextPending && !this.nextFired && !this.nextBlocked && nextAvailable
+                && ownValue(profile, "nextEpisode") === "button"
+                && insideSegments.some((segment) => segment.type === "credits")) {
+                const credits = insideSegments.filter((segment) => segment.type === "credits")
+                    .sort(compareSegmentActions)[0];
+                buttonAction = Object.freeze({
+                    kind: "next",
+                    mode: "button",
+                    id: `next:button:${credits.id}`,
+                    segmentId: credits.id,
+                    label: "Next Episode",
+                });
+            }
+            if (!buttonAction && !this.nativeSeeking && input.seeking !== true) {
+                const buttonSegments = insideSegments
+                    .filter((segment) => ownValue(profile, segment.type) === "button"
+                        && !this.firedSegmentIds.has(segment.id)
+                        && !this.pendingSegmentIds.has(segment.id)
+                        && !this.blockedSegmentIds.has(segment.id))
+                    .sort(compareSegmentActions);
+                const segment = buttonSegments[0];
+                if (segment) {
+                    buttonAction = Object.freeze({
+                        kind: "segment",
+                        mode: "button",
+                        id: segment.id,
+                        segmentId: segment.id,
+                        segmentType: segment.type,
+                        targetMs: segment.endMs,
+                        label: segmentActionLabel(segment.type),
+                    });
+                }
+            }
+
+            if (eventType === "seeked" && !showSkipSeeking) {
+                this.nativeSeeking = false;
+            }
+            this.previousPositionMs = positionMs;
+            this.previousWallMs = nowMs;
+            this.lastNaturalForward = naturalForward;
+            return actionResult(automaticAction, buttonAction, naturalForward);
+        }
+
+        reserve(action) {
+            if (!this.actionsEnabled || !action) {
+                return false;
+            }
+            if (action.kind === "segment") {
+                if (this.pendingSegmentIds.size > 0 || this.nextPending
+                    || this.firedSegmentIds.has(action.segmentId)
+                    || this.pendingSegmentIds.has(action.segmentId)
+                    || this.blockedSegmentIds.has(action.segmentId)) {
+                    return false;
+                }
+                this.pendingSegmentIds.add(action.segmentId);
+                return true;
+            }
+            if (action.kind === "next" && !this.nextPending && !this.nextFired && !this.nextBlocked) {
+                this.nextPending = true;
+                return true;
+            }
+            return false;
+        }
+
+        beginShowSkipSeek(action, targetMs) {
+            if (action && action.kind === "segment" && this.pendingSegmentIds.has(action.segmentId)) {
+                this.showSkipSeek = Object.freeze({ segmentId: action.segmentId, targetMs });
+            }
+        }
+
+        complete(action, succeeded, nowMs) {
+            if (!action) {
+                return;
+            }
+            if (action.kind === "segment") {
+                this.pendingSegmentIds.delete(action.segmentId);
+                if (succeeded) {
+                    this.firedSegmentIds.add(action.segmentId);
+                    this.suppressUntilWallMs = Math.max(
+                        this.suppressUntilWallMs,
+                        nowMs + this.limits.showSkipCompletionSuppressionMs,
+                    );
+                } else {
+                    this.blockedSegmentIds.add(action.segmentId);
+                }
+                if (this.showSkipSeek && this.showSkipSeek.segmentId === action.segmentId) {
+                    this.showSkipSeek = null;
+                }
+            } else if (action.kind === "next") {
+                this.nextPending = false;
+                this.nextFired = succeeded;
+                this.nextBlocked = !succeeded;
+            }
+        }
+
+        debugState() {
+            return Object.freeze({
+                sessionKey: this.sessionKey,
+                firedSegmentIds: Object.freeze([...this.firedSegmentIds]),
+                pendingSegmentIds: Object.freeze([...this.pendingSegmentIds]),
+                blockedSegmentIds: Object.freeze([...this.blockedSegmentIds]),
+                previousPositionMs: this.previousPositionMs,
+                previousWallMs: this.previousWallMs,
+                nativeSeeking: this.nativeSeeking,
+                showSkipSeek: this.showSkipSeek,
+                suppressUntilWallMs: this.suppressUntilWallMs,
+                nextPending: this.nextPending,
+                nextFired: this.nextFired,
+                nextBlocked: this.nextBlocked,
+            });
+        }
+
+        _isNaturalEntry(segment, previousPositionMs, positionMs) {
+            const beforeBoundary = previousPositionMs <= segment.startMs;
+            const inEntryWindow = positionMs >= Math.max(0, segment.startMs - this.limits.segmentStartGraceMs)
+                && positionMs < segment.endMs - this.limits.segmentEndToleranceMs
+                && positionMs <= segment.startMs + this.limits.segmentStartGraceMs;
+            if (segment.startMs > 0) {
+                return beforeBoundary && inEntryWindow;
+            }
+            return this.initialPositionMs <= this.limits.segmentStartGraceMs
+                && previousPositionMs <= this.limits.segmentStartGraceMs
+                && positionMs < segment.endMs - this.limits.segmentEndToleranceMs
+                && positionMs <= this.limits.segmentStartGraceMs + this.limits.naturalForwardSlackMs;
+        }
+    }
+
+    class PlayerActionRenderer {
+        constructor(documentObject, options = {}) {
+            this.document = documentObject;
+            this.actionsEnabled = options.actionsEnabled === true;
+            this.root = null;
+            this.button = null;
+            this.signature = null;
+            this.clickHandler = null;
+            this.busy = false;
+        }
+
+        render(action, contextSignature, onActivate, isLive) {
+            if (!this.actionsEnabled || !action || typeof onActivate !== "function" || typeof isLive !== "function") {
+                this.clear();
+                return false;
+            }
+            const target = resolveActiveSeekTarget(this.document);
+            if (!target) {
+                this.clear();
+                return false;
+            }
+            this._removeOtherRoots(this.root);
+            const signature = `${contextSignature}|${action.kind}|${action.mode}|${action.id}`;
+            if (this.root && this.root.isConnected !== false && this.root.parentNode === target.player
+                && this.signature === signature) {
+                return true;
+            }
+            this.clear();
+            const root = this.document.createElement("div");
+            root.setAttribute("data-showskip-owned", "playback-action");
+            root.setAttribute("data-showskip-playback-action-root", "");
+            const button = this.document.createElement("button");
+            button.setAttribute("type", "button");
+            button.setAttribute("data-showskip-playback-action", action.kind);
+            button.setAttribute("aria-label", action.label);
+            button.setAttribute("data-showskip-action-id", action.id);
+            if (action.segmentType) {
+                button.setAttribute("data-showskip-segment-type", action.segmentType);
+            }
+            button.type = "button";
+            button.textContent = action.label;
+            this.root = root;
+            this.button = button;
+            this.signature = signature;
+            this.busy = false;
+            this.clickHandler = () => {
+                let live = false;
+                try {
+                    live = isLive(action, contextSignature) === true;
+                } catch (_error) {
+                    live = false;
+                }
+                if (this.busy || !this.actionsEnabled || this.button !== button
+                    || this.signature !== signature || root.isConnected === false || !live) {
+                    return;
+                }
+                this.busy = true;
+                button.disabled = true;
+                button.setAttribute("aria-busy", "true");
+                void Promise.resolve().then(() => onActivate(action, contextSignature)).catch(() => undefined).finally(() => {
+                    if (this.button === button && this.signature === signature) {
+                        this.clear();
+                    }
+                });
+            };
+            button.addEventListener("click", this.clickHandler);
+            root.appendChild(button);
+            target.player.appendChild(root);
+            this._removeOtherRoots(root);
+            return true;
+        }
+
+        clear() {
+            if (this.button && this.clickHandler) {
+                this.button.removeEventListener("click", this.clickHandler);
+            }
+            removeNode(this.root);
+            this.root = null;
+            this.button = null;
+            this.signature = null;
+            this.clickHandler = null;
+            this.busy = false;
+            this._removeOtherRoots(null);
+        }
+
+        destroy() {
+            this.clear();
+        }
+
+        _removeOtherRoots(keep) {
+            if (!this.document || typeof this.document.querySelectorAll !== "function") {
+                return;
+            }
+            for (const candidate of Array.from(this.document.querySelectorAll(ACTION_BUTTON_ROOT_SELECTOR))) {
+                if (candidate !== keep) {
+                    removeNode(candidate);
                 }
             }
         }
@@ -2259,15 +3025,43 @@
             this.onProviderUsed = options.onProviderUsed;
             this.timeline = options.timeline || new TimelineRenderer(this.document);
             this.AbortController = options.AbortController || this.window.AbortController || globalThis.AbortController;
+            this.actionsEnabled = options.actionsEnabled === true;
+            this.getProfile = typeof options.getProfile === "function"
+                ? options.getProfile
+                : async (showKey) => ({ profile: createDefaultProfile(showKey) });
+            this.getCurrentRoute = typeof options.getCurrentRoute === "function"
+                ? options.getCurrentRoute
+                : () => this.route;
+            this.now = typeof options.now === "function"
+                ? options.now
+                : (this.window.performance && typeof this.window.performance.now === "function"
+                    ? this.window.performance.now.bind(this.window.performance)
+                    : Date.now);
+            this.actionState = options.actionState || new PlaybackActionStateMachine({
+                actionsEnabled: this.actionsEnabled,
+            });
+            this.actionRenderer = options.actionRenderer || new PlayerActionRenderer(this.document, {
+                actionsEnabled: this.actionsEnabled,
+            });
+            this.nextAdapter = options.nextAdapter || new NextEpisodeAdapter({
+                actionsEnabled: this.actionsEnabled,
+                validateContext: (context) => this._actionContextIsLive(context),
+            });
             this.route = null;
             this.identity = null;
             this.identityAbort = null;
             this.identityRevalidationPending = false;
+            this.profile = null;
+            this.profileShowKey = null;
             this.adapter = null;
             this.unsubscribeMedia = null;
             this.source = "";
             this.episodeToken = 0;
             this.mediaToken = 0;
+            this.actionEpoch = 0;
+            this.actionContext = null;
+            this.actionAbort = null;
+            this.pendingAction = null;
             this.requestAbort = null;
             this.requestDurationMs = null;
             this.currentBundle = null;
@@ -2279,6 +3073,7 @@
                 clearTimeout: this.window.clearTimeout.bind(this.window),
                 onStable: ({ scopeKey, durationMs }) => this._lookup(scopeKey, durationMs),
                 onLimit: () => {
+                    this._resetActions();
                     this._cancelRequest();
                     this.currentBundle = null;
                     this.currentDurationMs = null;
@@ -2320,6 +3115,29 @@
                 this.identity = identity;
             }
 
+            if (this.actionsEnabled && this.identity.identitySource === "route+core"
+                && (!this.profile || this.profileShowKey !== this.identity.showKey)) {
+                const episodeToken = this.episodeToken;
+                const routeSignature = this.route.signature;
+                const showKey = this.identity.showKey;
+                try {
+                    const result = await this.getProfile(showKey);
+                    if (this.destroyed || episodeToken !== this.episodeToken || !this.route
+                        || this.route.signature !== routeSignature || !this.identity
+                        || this.identity.showKey !== showKey || this.identity.identitySource !== "route+core") {
+                        return false;
+                    }
+                    this.profile = result && isPlainObject(result.profile) ? result.profile : null;
+                    this.profileShowKey = this.profile ? showKey : null;
+                } catch (_error) {
+                    this.profile = null;
+                    this.profileShowKey = null;
+                }
+            }
+            if (this.actionsEnabled && this.identity.identitySource !== "route+core") {
+                this._resetActions();
+            }
+
             const video = resolveActiveHtmlVideo(this.document, this.window);
             if (!video) {
                 this._detachMedia();
@@ -2337,6 +3155,7 @@
                 this._changeSource(snapshot.source);
             }
             if (!snapshot.source || !snapshot.durationMs) {
+                this._resetActions();
                 this.timeline.clear();
                 this.durationStabilizer.update(this._scopeKey(), null);
                 return this.identity.identitySource !== "route";
@@ -2346,6 +3165,7 @@
                 this._cancelRequest();
             }
             if (this.currentDurationMs !== snapshot.durationMs) {
+                this._resetActions();
                 this.currentBundle = this.bundlesByDuration.get(snapshot.durationMs) || null;
                 this.currentDurationMs = this.currentBundle ? snapshot.durationMs : null;
                 if (!this.currentBundle) {
@@ -2377,6 +3197,8 @@
             this.route = null;
             this.identity = null;
             this.identityRevalidationPending = false;
+            this.profile = null;
+            this.profileShowKey = null;
         }
 
         destroy() {
@@ -2385,6 +3207,7 @@
             }
             this.destroyed = true;
             this.deactivate();
+            this.actionRenderer.destroy();
             this.timeline.destroy();
             this.durationStabilizer.destroy();
             this.provider.destroy();
@@ -2392,16 +3215,22 @@
 
         _bindMedia(video) {
             this._detachMedia();
-            this.adapter = new HtmlMediaAdapter(this.window, video);
-            this.mediaToken += 1;
-            this.unsubscribeMedia = this.adapter.subscribe(({ type }) => {
-                if (type === "loadedmetadata" || type === "durationchange" || type === "loadstart" || type === "emptied") {
-                    this.onSchedule();
-                }
+            this.adapter = new HtmlMediaAdapter(this.window, video, {
+                actionsEnabled: this.actionsEnabled,
+                resolveActiveVideo: () => resolveActiveHtmlVideo(this.document, this.window),
+                validateContext: (context) => this._actionContextIsLive(context),
+                onShowSkipSeekStart: (_context, targetMs) => {
+                    if (this.pendingAction) {
+                        this.actionState.beginShowSkipSeek(this.pendingAction.action, targetMs);
+                    }
+                },
             });
+            this.mediaToken += 1;
+            this.unsubscribeMedia = this.adapter.subscribe((event) => this._handleMediaEvent(event));
         }
 
         _detachMedia() {
+            this._resetActions();
             this._cancelRequest();
             this.durationStabilizer.reset(null);
             this.timeline.clear();
@@ -2421,6 +3250,7 @@
         }
 
         _changeSource(source) {
+            this._resetActions();
             this._cancelRequest();
             this.durationStabilizer.reset(null);
             this.timeline.clear();
@@ -2468,6 +3298,7 @@
                         this.currentDurationMs = durationMs;
                         this._renderCurrent(durationMs);
                     } else {
+                        this._resetActions();
                         this.currentBundle = null;
                         this.currentDurationMs = null;
                         this.timeline.clear();
@@ -2475,6 +3306,7 @@
                 })
                 .catch((error) => {
                     if (!error || error.name !== "AbortError") {
+                        this._resetActions();
                         this.timeline.clear();
                     }
                 })
@@ -2500,6 +3332,257 @@
             if (rendered > 0) {
                 this.onProviderUsed(this.identity.showKey);
             }
+            const snapshot = this._liveSnapshot(durationMs);
+            if (snapshot) {
+                this._refreshActionContext(durationMs);
+                this._processPlaybackObservation("bundle", snapshot);
+            }
+        }
+
+        _handleMediaEvent({ type, snapshot }) {
+            if (this.destroyed || !this.adapter) {
+                return;
+            }
+            if (type === "loadedmetadata" || type === "durationchange" || type === "loadstart" || type === "emptied") {
+                this.onSchedule();
+            }
+            if (type === "loadstart" || type === "emptied"
+                || !snapshot.connected || snapshot.source !== this.source
+                || (this.currentDurationMs !== null && snapshot.durationMs !== this.currentDurationMs)) {
+                this._resetActions();
+                if (snapshot.source !== this.source || snapshot.durationMs !== this.currentDurationMs) {
+                    this.onSchedule();
+                }
+                return;
+            }
+            if (this.actionsEnabled && this.actionContext) {
+                this._processPlaybackObservation(type, snapshot);
+            }
+        }
+
+        _refreshActionContext(durationMs) {
+            if (!this.actionsEnabled || !this.identity || this.identity.identitySource !== "route+core"
+                || !this.profile || this.profileShowKey !== this.identity.showKey
+                || !this.currentBundle || !this.adapter || !this.route || !this.source
+                || this.identityRevalidationPending || this.currentDurationMs !== durationMs) {
+                this._resetActions();
+                return null;
+            }
+            if (this.actionContext
+                && this.actionContext.routeSignature === this.route.signature
+                && this.actionContext.episodeKey === this.identity.episodeKey
+                && this.actionContext.episodeToken === this.episodeToken
+                && this.actionContext.mediaToken === this.mediaToken
+                && this.actionContext.adapter === this.adapter
+                && this.actionContext.video === this.adapter.video
+                && this.actionContext.source === this.source
+                && this.actionContext.durationMs === durationMs) {
+                return this.actionContext;
+            }
+            this._resetActions();
+            const context = Object.freeze({
+                actionEpoch: this.actionEpoch,
+                routeSignature: this.route.signature,
+                episodeKey: this.identity.episodeKey,
+                episodeToken: this.episodeToken,
+                mediaToken: this.mediaToken,
+                identitySource: this.identity.identitySource,
+                metaId: this.identity.stremioSeriesId,
+                videoId: this.identity.stremioVideoId,
+                season: this.identity.season,
+                episode: this.identity.episode,
+                adapter: this.adapter,
+                video: this.adapter.video,
+                source: this.source,
+                durationMs,
+            });
+            this.actionContext = context;
+            this.actionState.reset(this._actionSessionKey(context));
+            return context;
+        }
+
+        _actionContextIsLive(context) {
+            if (!this.actionsEnabled || !context || context !== this.actionContext || this.destroyed
+                || !this.route || !this.identity || this.identity.identitySource !== "route+core"
+                || this.identityRevalidationPending || !this.profile || !this.currentBundle
+                || context.actionEpoch !== this.actionEpoch
+                || context.routeSignature !== this.route.signature
+                || context.episodeKey !== this.identity.episodeKey
+                || context.episodeToken !== this.episodeToken || context.mediaToken !== this.mediaToken
+                || context.adapter !== this.adapter || !this.adapter || context.video !== this.adapter.video
+                || context.source !== this.source || context.durationMs !== this.currentDurationMs
+                || this.currentBundle.request.durationMs !== context.durationMs
+                || this.currentBundle.media.episodeKey !== context.episodeKey
+                || resolveActiveHtmlVideo(this.document, this.window) !== context.video) {
+                return false;
+            }
+            let currentRoute;
+            try {
+                currentRoute = this.getCurrentRoute();
+            } catch (_error) {
+                return false;
+            }
+            if (!currentRoute || currentRoute.kind !== "player" || currentRoute.eligible !== true
+                || currentRoute.signature !== context.routeSignature
+                || currentRoute.metaId !== context.metaId || currentRoute.videoId !== context.videoId
+                || currentRoute.season !== context.season || currentRoute.episode !== context.episode) {
+                return false;
+            }
+            const snapshot = this.adapter.getSnapshot();
+            return snapshot.connected && snapshot.source === context.source
+                && snapshot.durationMs === context.durationMs;
+        }
+
+        _processPlaybackObservation(eventType, snapshot) {
+            const context = this.actionContext;
+            if (!this.actionsEnabled || !this._actionContextIsLive(context)
+                || !snapshot || snapshot.currentTimeMs === null) {
+                this.actionRenderer.clear();
+                return;
+            }
+            let availability = nextAvailability(false, false, "mechanism-unavailable");
+            if (this.nextAdapter && typeof this.nextAdapter.getAvailability === "function") {
+                availability = this.nextAdapter.getAvailability(context);
+            }
+            const decision = this.actionState.observe({
+                sessionKey: this._actionSessionKey(context),
+                eventType,
+                positionMs: snapshot.currentTimeMs,
+                durationMs: snapshot.durationMs,
+                paused: snapshot.paused,
+                seeking: snapshot.seeking,
+                ended: snapshot.ended,
+                playbackRate: snapshot.playbackRate,
+                nowMs: this.now(),
+                segments: this.currentBundle.segments,
+                profile: this.profile,
+                nextAvailable: availability.known && availability.available,
+            });
+            const contextSignature = this._actionSessionKey(context);
+            if (decision.automaticAction && !this.pendingAction) {
+                this.actionRenderer.clear();
+                void this._executeAction(decision.automaticAction, context, contextSignature);
+                return;
+            }
+            if (decision.buttonAction && !this.pendingAction) {
+                this.actionRenderer.render(
+                    decision.buttonAction,
+                    contextSignature,
+                    (action, signature) => this._activateButton(action, context, signature),
+                    (action, signature) => this._buttonActionIsLive(action, context, signature),
+                );
+            } else {
+                this.actionRenderer.clear();
+            }
+        }
+
+        _buttonActionIsLive(action, context, contextSignature) {
+            if (!this.actionsEnabled || this.pendingAction || contextSignature !== this._actionSessionKey(context)
+                || !this._actionContextIsLive(context) || !action || !this.currentBundle) {
+                return false;
+            }
+            const snapshot = this.adapter.getSnapshot();
+            if (snapshot.currentTimeMs === null || snapshot.seeking === true) {
+                return false;
+            }
+            const state = this.actionState.debugState();
+            const segments = validActionSegments(this.currentBundle.segments, context.durationMs);
+            const inside = segments.filter((segment) => snapshot.currentTimeMs >= segment.startMs
+                && snapshot.currentTimeMs < segment.endMs - PLAYBACK_ACTION_LIMITS.segmentEndToleranceMs);
+            let availability = nextAvailability(false, false, "mechanism-unavailable");
+            if (this.nextAdapter && typeof this.nextAdapter.getAvailability === "function") {
+                availability = this.nextAdapter.getAvailability(context);
+            }
+            if (action.kind === "next") {
+                return ownValue(this.profile, "nextEpisode") === "button"
+                    && availability.known && availability.available
+                    && inside.some((segment) => segment.type === "credits" && segment.id === action.segmentId);
+            }
+            if (action.kind !== "segment" || ownValue(this.profile, action.segmentType) !== "button"
+                || state.firedSegmentIds.includes(action.segmentId)
+                || state.pendingSegmentIds.includes(action.segmentId)
+                || state.blockedSegmentIds.includes(action.segmentId)) {
+                return false;
+            }
+            if (ownValue(this.profile, "nextEpisode") === "button"
+                && availability.known && availability.available
+                && inside.some((segment) => segment.type === "credits")) {
+                return false;
+            }
+            const candidates = inside.filter((segment) => ownValue(this.profile, segment.type) === "button"
+                && !state.firedSegmentIds.includes(segment.id)
+                && !state.pendingSegmentIds.includes(segment.id)
+                && !state.blockedSegmentIds.includes(segment.id)).sort(compareSegmentActions);
+            return Boolean(candidates[0] && candidates[0].id === action.segmentId
+                && candidates[0].endMs === action.targetMs && candidates[0].type === action.segmentType);
+        }
+
+        _activateButton(action, context, contextSignature) {
+            if (!this._buttonActionIsLive(action, context, contextSignature)) {
+                return Promise.resolve(false);
+            }
+            return this._executeAction(action, context, contextSignature);
+        }
+
+        async _executeAction(action, context, contextSignature) {
+            if (!this.actionsEnabled || this.pendingAction || !this._actionContextIsLive(context)
+                || contextSignature !== this._actionSessionKey(context)
+                || typeof this.AbortController !== "function") {
+                return false;
+            }
+            const controller = new this.AbortController();
+            if (!this.actionState.reserve(action)) {
+                return false;
+            }
+            const pending = Object.freeze({ action, context, contextSignature, controller });
+            this.pendingAction = pending;
+            this.actionAbort = controller;
+            this.actionRenderer.clear();
+            let result = Object.freeze({ ok: false, reason: "action-failed" });
+            try {
+                if (action.kind === "segment") {
+                    result = await this.adapter.seekToMs(action.targetMs, context, controller.signal);
+                } else if (action.kind === "next" && this.nextAdapter
+                    && typeof this.nextAdapter.advance === "function") {
+                    result = await this.nextAdapter.advance(context, controller.signal);
+                } else {
+                    result = Object.freeze({ ok: false, reason: "mechanism-unavailable" });
+                }
+            } catch (_error) {
+                result = Object.freeze({
+                    ok: false,
+                    reason: controller.signal.aborted ? "aborted" : "action-failed",
+                });
+            }
+            if (this.pendingAction !== pending || this.actionContext !== context) {
+                return false;
+            }
+            this.pendingAction = null;
+            this.actionAbort = null;
+            this.actionState.complete(action, Boolean(result && result.ok), this.now());
+            if (this._actionContextIsLive(context)) {
+                this._processPlaybackObservation("action-complete", this.adapter.getSnapshot());
+            }
+            return Boolean(result && result.ok);
+        }
+
+        _actionSessionKey(context) {
+            return context
+                ? `${context.actionEpoch}|${context.routeSignature}|${context.episodeKey}|${context.episodeToken}`
+                    + `|${context.mediaToken}|${context.durationMs}|${stableHash(context.source)}`
+                : "";
+        }
+
+        _resetActions() {
+            if (this.actionAbort) {
+                this.actionAbort.abort();
+            }
+            this.actionAbort = null;
+            this.pendingAction = null;
+            this.actionContext = null;
+            this.actionEpoch += 1;
+            this.actionState.reset(null);
+            this.actionRenderer.clear();
         }
 
         _cancelRequest() {
@@ -2763,6 +3846,44 @@
                 color: var(--showskip-primary-text);
                 text-decoration: underline;
                 text-underline-offset: 0.14em;
+            }
+            [data-showskip-playback-action-root] {
+                position: absolute;
+                right: max(1.25rem, env(safe-area-inset-right));
+                bottom: max(5.25rem, calc(env(safe-area-inset-bottom) + 4rem));
+                z-index: 4;
+                display: flex;
+                justify-content: flex-end;
+                pointer-events: none;
+            }
+            [data-showskip-playback-action] {
+                appearance: none;
+                min-width: 44px;
+                min-height: 44px;
+                padding: 0.62rem 1rem;
+                border: 1px solid rgba(255, 255, 255, 0.24);
+                border-radius: 0.62rem;
+                color: #ffffff;
+                background: rgba(29, 25, 39, 0.9);
+                box-shadow: 0 0.42rem 1.2rem rgba(0, 0, 0, 0.34);
+                cursor: pointer;
+                font: inherit;
+                font-size: 0.86rem;
+                font-weight: 650;
+                line-height: 1.2;
+                pointer-events: auto;
+                backdrop-filter: blur(12px);
+            }
+            [data-showskip-playback-action]:hover {
+                background: rgba(103, 69, 199, 0.96);
+            }
+            [data-showskip-playback-action]:focus-visible {
+                outline: 2px solid #ffffff;
+                outline-offset: 3px;
+            }
+            [data-showskip-playback-action]:disabled {
+                cursor: wait;
+                opacity: 0.68;
             }
             [data-showskip-timeline-layer] {
                 position: absolute;
@@ -3145,7 +4266,7 @@
             const note = this.panel.querySelector("[data-showskip-note]");
             if (note) {
                 const message = this.store.getStatus().mode === "writable"
-                    ? "Playback rules are saved for this show. Playback actions arrive in a later phase."
+                    ? "Playback rules are saved for this show. The current safety gate keeps playback actions disabled."
                     : "Changes are temporary because Enhanced settings are unavailable this session.";
                 if (note.textContent !== message) {
                     note.textContent = message;
@@ -3329,6 +4450,9 @@
                 onSchedule: () => this.scheduleReconcile(),
                 onProviderUsed: (showKey) => this.providerUsedShows.add(showKey),
                 AbortController: windowObject.AbortController,
+                actionsEnabled: PHASE3_PLAYBACK_ACTIONS_ENABLED,
+                getProfile: (showKey) => this.store.getOrCreateProfile(showKey),
+                getCurrentRoute: () => this.contextDetector.current(),
             });
             this.documentObserver = null;
             this.loaderObserver = null;
@@ -3552,6 +4676,8 @@
                 DEFAULT_PROFILE_VALUES,
                 PANEL_PALETTE,
                 PANEL_ROWS,
+                PHASE3_PLAYBACK_ACTIONS_ENABLED,
+                PLAYBACK_ACTION_LIMITS,
                 PROVIDER_LIMITS,
                 ProfileStore,
                 CoalescedScheduler,
@@ -3559,7 +4685,10 @@
                 DurationStabilizer,
                 EpisodeIdentityProvider,
                 HtmlMediaAdapter,
+                NextEpisodeAdapter,
+                PlaybackActionStateMachine,
                 PlayerController,
+                PlayerActionRenderer,
                 SessionSegmentCache,
                 ShowPageController,
                 TheIntroDBProvider,
@@ -3585,9 +4714,11 @@
                 resolveActiveRouteRoot,
                 resolveActiveSeekTarget,
                 segmentAccessibleLabel,
+                segmentActionLabel,
                 selectReconcileProfile,
                 serializedByteLength,
                 validateTheIntroDbResponse,
+                validActionSegments,
             }),
         });
         return;

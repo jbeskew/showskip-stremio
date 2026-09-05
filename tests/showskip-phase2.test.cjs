@@ -472,7 +472,7 @@ test("active HTML media selection is last-route scoped and fails closed on ambig
     assert.equal(resolveActiveHtmlVideo(multiple.documentObject, multiple.windowObject), multiple.videos[0]);
 });
 
-test("HtmlMediaAdapter observes source and duration without exposing or performing writes", () => {
+test("HtmlMediaAdapter remains read-only unless its explicit action capability is enabled", () => {
     const video = new FakeElement("video");
     let writes = 0;
     let currentTime = 12.345;
@@ -493,6 +493,10 @@ test("HtmlMediaAdapter observes source and duration without exposing or performi
         durationMs: 100000,
         readyState: 4,
         source: "https://stream.invalid/video",
+        paused: null,
+        seeking: null,
+        ended: null,
+        playbackRate: null,
     });
     video.dispatch("durationchange");
     video.dispatch("timeupdate");
@@ -1250,9 +1254,13 @@ test("PlayerController ignores a provider result after episode teardown", async 
     controller.destroy();
 });
 
-test("production source contains no Phase 3 media writes or synthetic player actions", () => {
+test("production source keeps the Phase 3 gate false and confines its sole media write to HtmlMediaAdapter", () => {
     const source = fs.readFileSync(path.join(__dirname, "..", "ShowSkip.plugin.js"), "utf8");
-    assert.doesNotMatch(source, /\.currentTime\s*=/u);
+    assert.match(source, /const PHASE3_PLAYBACK_ACTIONS_ENABLED = false;/u);
+    const writes = [...source.matchAll(/\.currentTime\s*=/gu)];
+    assert.equal(writes.length, 1);
+    assert.ok(writes[0].index > source.indexOf("class HtmlMediaAdapter"));
+    assert.ok(writes[0].index < source.indexOf("class NextEpisodeAdapter"));
     assert.doesNotMatch(source, /dispatchEvent\s*\(\s*new\s+KeyboardEvent/u);
     assert.doesNotMatch(source, /Player\/NextVideo|Shift\+N|mpv-set-prop/u);
     assert.doesNotMatch(source, /\beval\s*\(|new\s+Function\b/u);

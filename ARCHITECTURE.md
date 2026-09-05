@@ -1,15 +1,15 @@
 # ShowSkip Architecture
 
-Status: Phase 2 provider/timeline implementation complete; automated and public-web DOM validation complete; packaged Enhanced Phase 2 validation pending
-Research date: 2026-08-20
+Status: Phase 3 playback-action architecture complete behind a production-disabled gate; automated and public-web DOM validation complete; consolidated packaged Enhanced Phase 2 + 3 validation pending
+Research dates: provider/seek baseline 2026-08-20; next-action sources 2026-08-29; public trailer DOM recheck 2026-09-05
 Target: Stremio Enhanced for Windows
 Artifact: one self-contained `ShowSkip.plugin.js`
 
 ## 1. Scope and non-goals
 
-ShowSkip is a Stremio Enhanced UI/player plugin, not a Stremio addon. Phase 1 provides per-series playback-rule configuration for recap, intro, credits, preview, and next-episode behavior. Phase 2 resolves active episode/media context, fetches and validates TheIntroDB timestamps, and renders behavior-independent timeline regions whenever a supported HTML video and native seek bar are available. Later phases may apply the saved rules; Phase 2 never seeks, skips, or advances playback.
+ShowSkip is a Stremio Enhanced UI/player plugin, not a Stremio addon. Phase 1 provides per-series playback-rule configuration for recap, intro, credits, preview, and next-episode behavior. Phase 2 resolves active episode/media context, fetches and validates TheIntroDB timestamps, and renders behavior-independent timeline regions whenever a supported HTML video and native seek bar are available. Phase 3 implements conservative skip/action machinery, but the installed production artifact passes a literal false release gate to every playback-mutating boundary, so it still performs no seek, skip-button action, or episode transition.
 
-Phase 0 contained no production plugin, UI, player mutation, or server component. Phase 1 added the standalone foundation and per-show configuration UI recorded in section 14. Phase 2 adds only the client-side episode/provider/timeline implementation recorded in section 15. The project does not modify Stremio Enhanced, Stremio Web, normal Stremio, Stremio Service, or `server.js`.
+Phase 0 contained no production plugin, UI, player mutation, or server component. Phase 1 added the standalone foundation and per-show configuration UI recorded in section 14. Phase 2 added the client-side episode/provider/timeline implementation recorded in section 15. Phase 3 adds the gated action architecture recorded in section 16. The project does not modify Stremio Enhanced, Stremio Web, normal Stremio, Stremio Service, or `server.js`.
 
 ## 2. Research baseline
 
@@ -20,6 +20,8 @@ All repository conclusions below are pinned to commits rather than floating bran
 | [REVENGE977/stremio-enhanced](https://github.com/REVENGE977/stremio-enhanced) | [`0bb39a4263c26970247128c36d9ef8bd8a3c84ad`](https://github.com/REVENGE977/stremio-enhanced/commit/0bb39a4263c26970247128c36d9ef8bd8a3c84ad), `main`, 2026-06-26 | 1.2.0 |
 | [TheIntroDB/stremio-enhanced-plugin](https://github.com/TheIntroDB/stremio-enhanced-plugin) | [`d9e5e4d96ba430f85e456272d3099d03d8ac63cf`](https://github.com/TheIntroDB/stremio-enhanced-plugin/commit/d9e5e4d96ba430f85e456272d3099d03d8ac63cf), `main`, 2026-08-08 | 1.1.4 |
 | [Stremio/stremio-web](https://github.com/Stremio/stremio-web) | [`89927a60d104b94ae07486a317edefeb93e4f79a`](https://github.com/Stremio/stremio-web/commit/89927a60d104b94ae07486a317edefeb93e4f79a), `development`, 2026-08-19 | 5.0.0-beta.39 |
+| [Stremio/stremio-web current next-action recheck](https://github.com/Stremio/stremio-web) | [`00a63c199a841e70ffaa697d4fba65974ba28ead`](https://github.com/Stremio/stremio-web/commit/00a63c199a841e70ffaa697d4fba65974ba28ead), `main`, 2026-08-26 | current source pinned 2026-08-29 |
+| [Stremio/stremio-core current next-action recheck](https://github.com/Stremio/stremio-core) | [`e8862f2caf013c3314a1f4097c4ab51e6b7ba997`](https://github.com/Stremio/stremio-core/commit/e8862f2caf013c3314a1f4097c4ab51e6b7ba997), `development` | current source pinned 2026-08-29 |
 | [Stremio/stremio-video](https://github.com/Stremio/stremio-video) | [`607afd84e83ae4260b5ef24a3b328eb3f898cb3c`](https://github.com/Stremio/stremio-video/commit/607afd84e83ae4260b5ef24a3b328eb3f898cb3c), the npm `gitHead` used by current Stremio Web | 0.0.93 |
 | [TheIntroDB API reference](https://theintrodb.org/docs) | Live documentation and [OpenAPI 3.0 specification](https://theintrodb.org/openapi.yaml), read 2026-08-20 | API v3.0.0 |
 
@@ -271,11 +273,11 @@ Stremio Enhanced is a different Electron wrapper from the official Windows shell
 
 It is therefore a source-supported inference—not yet a target-runtime observation—that ordinary built-in playback in Enhanced 1.2.0 exposes an HTML `<video>`. Live public-web validation with a public-domain stream showed `<video playsinline>` under the current player container, and the official TheIntroDB Enhanced plugin relies on the same path. Stremio itself scopes HTML-media lookup through its video host at [`Player.js` lines 92–98](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/routes/Player/Player.js#L92-L98). Packaged Enhanced confirmation with a real built-in series stream remains required.
 
-The assumption has explicit limits: YouTube, Chromecast, external-player, and any future shell-backed path may not expose `<video>`. A live YouTube trailer rendered an iframe and no page-level video. Phase 2's `HtmlMediaAdapter` is created only when the last active route root contains exactly one visible player container, exactly one visible video container, and exactly one connected visible `<video>`. Zero or multiple candidates fail closed. The adapter exposes read-only snapshots of current time, rounded duration, ready state, and source plus media-event subscription; `capabilities.canSeek` is always `false`, and it contains no setters or seek method. A non-empty source and finite positive duration are additionally required before lookup or markers.
+The assumption has explicit limits: YouTube, Chromecast, external-player, and any future shell-backed path may not expose `<video>`. A live YouTube trailer rendered an iframe and no page-level video. `HtmlMediaAdapter` is created only when the last active route root contains exactly one visible player container, exactly one visible video container, and exactly one connected visible `<video>`. Zero or multiple candidates fail closed. Its snapshot includes current time, rounded duration, ready state, source, paused/seeking/ended flags, and playback rate. Phase 2 observation remains active normally. Phase 3 exposes `seekToMs`, but `capabilities.canSeek` is false in production because the literal gate is false; controlled tests may construct an enabled adapter. A non-empty source and finite positive duration are additionally required before lookup or markers.
 
 Enhanced's optional MPV/VLC setting is a separate external-process flow, not Stremio Web's `ShellVideo`. When enabled, Enhanced backs out of the built-in player before launching the external executable in [`externalPlayerInterceptor.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/preload/ui/externalPlayerInterceptor.ts#L15-L50). The scoped plugin API supplies no external-player clock, duration, subscription, or seek surface. ShowSkip therefore provides no on-page markers or skipping in external-player mode. It will not attempt raw MPV IPC, React internals, or synthetic seek-bar dragging.
 
-For the supported path, `HTMLVideo` creates and attaches the element in [`HTMLVideo.js` lines 18–100](https://github.com/Stremio/stremio-video/blob/607afd84e83ae4260b5ef24a3b328eb3f898cb3c/src/HTMLVideo/HTMLVideo.js#L18-L100), and Stremio's own abstraction seeks by assigning `currentTime` after converting milliseconds to seconds at [lines 415–418](https://github.com/Stremio/stremio-video/blob/607afd84e83ae4260b5ef24a3b328eb3f898cb3c/src/HTMLVideo/HTMLVideo.js#L415-L418). That is host research for a future Phase 3 gate only; Phase 2's adapter performs no equivalent write.
+For the supported path, `HTMLVideo` creates and attaches the element in [`HTMLVideo.js` lines 18–100](https://github.com/Stremio/stremio-video/blob/607afd84e83ae4260b5ef24a3b328eb3f898cb3c/src/HTMLVideo/HTMLVideo.js#L18-L100), and Stremio's own abstraction seeks by assigning `currentTime` after converting milliseconds to seconds at [lines 415–418](https://github.com/Stremio/stremio-video/blob/607afd84e83ae4260b5ef24a3b328eb3f898cb3c/src/HTMLVideo/HTMLVideo.js#L415-L418). Phase 3 uses the same underlying HTML-media primitive only inside its adapter after stricter context/seekability checks. Packaged validation must still prove Stremio UI, resume offset, history, and library bookkeeping follow the direct assignment before the production gate may be enabled.
 
 The seek bar renders a `Slider` between time labels in [`SeekBar.js`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/routes/Player/ControlBar/SeekBar/SeekBar.js#L44-L69). The slider owns four absolute layers: base track, buffered track, played/masked track, and thumb; see [`Slider.js`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/components/Slider/Slider.js#L134-L153) and [`Slider/styles.less`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/components/Slider/styles.less#L19-L92). CSS modules compile with generated suffixes, so those suffixes are never selectors; see [`webpack.config.js`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/webpack.config.js#L91-L98).
 
@@ -300,26 +302,16 @@ The official player model includes `metaItem`, `seriesInfo`, and `nextVideo`; se
 
 The current TheIntroDB plugin tries `window.services.core.transport.getState('player')`. Enhanced's own internal playback helper instead probes direct `core.getState('player')` after finding `window.core || window.services?.core` in [`PlaybackState.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/utils/PlaybackState.ts#L32-L57) and [`Helpers.ts`](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/utils/Helpers.ts#L165-L238). That helper is internal, is not in the scoped plugin API, and uses dynamic evaluation, so ShowSkip does not copy or depend on it. It documents that the live core global may disappear during playback; Phase 2 therefore captures bound readers from the three known shapes without replacing host globals or using `eval`. Reads remain bounded, own-property shape-checked, and route-cross-checked. Ordinary deployed Stremio Web did not expose `window.services` during live browser inspection, so exact Enhanced reader availability remains a packaged-runtime question; the strict route fallback keeps Phase 2 usable while later reconciles continue trying to promote or invalidate it.
 
-Core seek dispatch alone is not media control: current Stremio Web performs both private `video.setTime(time)` and core `seek(...)` in [`Player.js`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/routes/Player/Player.js#L266-L269). Any future Phase 3 seek must use a separately verified write-capable adapter and prove that Stremio UI/resume state follows it. Phase 2's adapter cannot seek.
+Core seek dispatch alone is not media control: Stremio Web performs both private media control and core bookkeeping. Phase 3 therefore uses no guessed core seek action. Its only position write is a direct HTML-media assignment inside `HtmlMediaAdapter`, after a stronger `route+core` action proof and current seekable-range validation. Packaged Enhanced still must prove that the native UI, resume position, seek history, and library bookkeeping remain coherent before activation.
 
-Stremio's next-video implementation is source-verified:
+The 2026-08-29 current-source recheck establishes why next episode remains unavailable in production:
 
-1. Dispatch `Player → NextVideo` to the player model in [`usePlayer.js`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/routes/Player/usePlayer.js#L149-L157).
-2. Navigate with replacement to `nextVideo.deepLinks.player`, or fall back to `deepLinks.metaDetailsStreams`, in [`Player.js`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/routes/Player/Player.js#L194-L225).
-3. The native control-bar next button calls the same callback when `nextVideo` exists; see [`ControlBar.js`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/routes/Player/ControlBar/ControlBar.js#L87-L91) and [lines 135–145](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/routes/Player/ControlBar/ControlBar.js#L135-L145).
-4. The fixed `playNext` shortcut is [`Shift+N`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/common/Shortcuts/shortcuts.json#L112-L116); its current handler performs the same guarded dispatch and deep-link navigation at [`Player.js` lines 781–788](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/routes/Player/Player.js#L781-L788). The document shortcut handler currently has no `isTrusted` requirement in [`Shortcuts.tsx`](https://github.com/Stremio/stremio-web/blob/89927a60d104b94ae07486a317edefeb93e4f79a/src/common/Shortcuts/Shortcuts.tsx#L37-L82).
+1. `player.nextVideo` is the authoritative availability value in current [`Player.d.ts`](https://github.com/Stremio/stremio-web/blob/00a63c199a841e70ffaa697d4fba65974ba28ead/src/core/types/models/Player.d.ts#L61-L72).
+2. The native flow dispatches `Player → NextVideo` in [`usePlayer.js`](https://github.com/Stremio/stremio-web/blob/00a63c199a841e70ffaa697d4fba65974ba28ead/src/routes/Player/usePlayer.js#L150-L157) and separately performs React-router navigation from validated deep links in the [compound player handler](https://github.com/Stremio/stremio-web/blob/00a63c199a841e70ffaa697d4fba65974ba28ead/src/routes/Player/Player.js#L353-L361). Core itself performs bookkeeping and explicitly leaves loading to the separate navigation step in [`player.rs`](https://github.com/Stremio/stremio-core/blob/e8862f2caf013c3314a1f4097c4ab51e6b7ba997/src/models/player.rs#L695-L735). Raw dispatch is therefore only half a transition.
+3. Enhanced's [scoped plugin API](https://github.com/REVENGE977/stremio-enhanced/blob/0bb39a4263c26970247128c36d9ef8bd8a3c84ad/src/preload/ui/mod/modController.ts#L26-L54) exposes settings/logging/alerts/prompts, not a compound next action or router.
+4. The native control is core-aware but private: current [`ControlBar.js`](https://github.com/Stremio/stremio-web/blob/00a63c199a841e70ffaa697d4fba65974ba28ead/src/routes/Player/ControlBar/ControlBar.js#L141-L153) renders a generic [`<div>` button](https://github.com/Stremio/stremio-web/blob/00a63c199a841e70ffaa697d4fba65974ba28ead/src/components/Button/Button.tsx#L58-L69) identified only by generated classes and localized title. It is not safe to locate by text/title alone.
 
-The core `NextVideo` action also updates seek-history/library state before navigation, as shown in the pinned core used by current Stremio Web at [`player.rs` lines 695–735](https://github.com/Stremio/stremio-core/blob/474ffaa42e0b7b9bcba0dd99368c41e828579dec/src/models/player.rs#L695-L735). This is why route construction alone is not an acceptable fallback.
-
-Chosen safety order for Phase 3:
-
-1. Establish next availability through either a shape-validated `player.nextVideo` from the captured core state or an unambiguously identified mounted native next control. Never infer it from episode numbering.
-2. Use a host-supported single next action if Phase 3 discovers and validates one in the Enhanced page world.
-3. Otherwise use the app's source-verified `Shift+N` shortcut only after Phase 3 confirms synthetic key handling in Enhanced, the player route is focused, no input/modal is active, and exactly one core-aware transition occurs. Until that test passes, the synthetic path is disabled.
-4. Use the unambiguously identified mounted native next control as a fallback when it is the availability proof; never select it by translated text or a generated class suffix.
-5. If availability or every action path is unvalidated, do nothing and log one warning. Do not reproduce private navigation by guessing a URL or synthesizing an episode number.
-
-This path must be tested in Enhanced with a real multi-episode series before any automatic next behavior is enabled.
+`NextEpisodeAdapter` is consequently an injectable capability boundary whose production construction receives neither an availability reader nor transition driver. It reports `mechanism-unavailable` even if the release gate is later toggled. Tests inject a deterministic fake driver. ShowSkip does not dispatch raw `Player/NextVideo`, parse/construct deep links, guess routes or episode numbers, click a title-only DOM node, or synthesize `Shift+N`/other keyboard events. A future driver must prove authoritative availability and one complete route transition in packaged Enhanced before it can be wired and enabled.
 
 ## 6. Implemented architecture and future boundaries
 
@@ -333,11 +325,14 @@ The shipped file is a single bundle, but its source retains explicit responsibil
 | `SegmentProvider` / `TheIntroDBProvider` | Fetch, validate, and normalize episode segments | Touch player DOM or apply rules |
 | `ShowPageController` | Launcher, fully removable panel, profile editing | Control playback |
 | `TimelineRenderer` | Seek-bar overlay and hover tooltip | Decide skip behavior |
-| `HtmlMediaAdapter` | Observe exactly one validated active HTML video through read-only snapshots/events | Seek or mutate any media property |
+| `HtmlMediaAdapter` | Observe one validated active HTML video; when explicitly capability-enabled, own the sole checked/verified `currentTime` assignment | Seek without gate/context/source/duration/seekable proof |
+| `PlaybackActionStateMachine` | Infer natural entry, suppress seeks/resumes, track pending/fired/blocked/rearm/next state, and arbitrate one intent | Touch DOM, media, provider, or persistence |
+| `PlayerActionRenderer` | Own at most one accessible segment/next button under the active player | Render while gate-off or retain a stale actionable control |
+| `NextEpisodeAdapter` | Require verified next availability and a complete injected host transition | Guess/decompose routes, use raw dispatch alone, or synthesize keys |
 | `DurationStabilizer` | Debounce exact durations and cap lookups per source/context | Fetch or cache provider data |
-| `PlayerController` | Coordinate identity, adapter, duration, provider, token checks, and timeline lifecycle | Implement skip/next behavior or parse series-page UI |
+| `PlayerController` | Coordinate identity/profile/media/provider/timeline plus exact action contexts and abortable single-flight execution | Parse series-page UI or bypass an adapter |
 
-`PlayerController` depends on a narrow playback-observation boundary. Phase 2 implements only `HtmlMediaAdapter`; an unsupported implementation fails closed. The class name intentionally differs from Phase 0's proposed `HtmlVideoAdapter` to emphasize media-capability observation rather than future control. Shared helpers cover logging, abortable delays, owned DOM/style creation, validation, and teardown registration.
+`PlayerController` depends on narrow media and next-capability boundaries. Phase 2 observation and markers remain independent of profiles and the gate. Phase 3 action context is stronger: only `route+core` identity can produce it, and it captures route signature, episode key/token, media token, exact adapter/video/source/duration, and an action epoch. Unsupported implementations and route-only identities continue to receive markers but no playback action.
 
 ### 6.1 Lifecycle state machine
 
@@ -403,7 +398,7 @@ The parsed `location.hash` is the authority for which controller may be active; 
     currentTimeMs: null,
     durationMs: null,
     readyState: 0,
-    canSeek: false
+    canSeek: PHASE3_PLAYBACK_ACTIONS_ENABLED
   },
   lifetime: {
     episodeToken: 1,
@@ -568,28 +563,32 @@ Each region is native-track-height, percent-positioned, rounded, semi-transparen
 
 ### 6.7 Playback rules
 
-#### Phase 2 observation contract
+#### Media observation and gated seek contract
 
-Phase 2 uses this read-only contract:
+Phase 2 uses the observation half normally; Phase 3 uses the seek half only when explicitly constructed with the internal action gate enabled:
 
 ```javascript
 HtmlMediaAdapter = {
   capabilities: {
     canObserveTime: true,
     canObserveDuration: true,
-    canSeek: false
+    canSeek: actionsEnabled === true
   },
-  getSnapshot(), // connected, currentTimeMs, durationMs, readyState, source
+  getSnapshot(), // connected, currentTimeMs, durationMs, readyState, source,
+                 // paused, seeking, ended, playbackRate
   subscribe(listener),
+  seekToMs(targetMs, exactContext, abortSignal),
   destroy()
 }
 ```
 
-`HtmlMediaAdapter` wraps exactly one eligible connected visible `<video>` beneath the active native player host. It observes `loadedmetadata`, `durationchange`, `loadstart`, `emptied`, `timeupdate`, `seeking`, `seeked`, `play`, and `ended`, converting readable seconds to integer milliseconds at the boundary. It never controls an arbitrary document video and exposes no `canSeekToMs` or `seekToMs` method. Provider/timeline orchestration reacts only to metadata, duration, source, video replacement, route changes, and teardown; observed time/seeking/play events do not trigger Phase 2 actions.
+`HtmlMediaAdapter` wraps exactly one eligible connected visible `<video>` beneath the active native player host. It observes `loadedmetadata`, `durationchange`, `loadstart`, `emptied`, `timeupdate`, `seeking`, `seeked`, `play`, `playing`, `pause`, `ratechange`, and `ended`, converting readable seconds to integer milliseconds at the boundary.
 
-#### Phase 3 design record (not implemented)
+`seekToMs` first refuses gate-off, destroyed, busy, stale, route-only, disconnected, replaced, source/duration-mismatched, non-forward, non-finite, and non-seekable requests. Its exact context is the currently owned action-context object, not merely an equal set of strings. Current `TimeRanges` are read defensively; the target must lie inside a range or within the 500 ms edge tolerance, with no gap bridging. Listeners are installed before the only `video.currentTime = target / 1000` assignment. A `seeked` or `timeupdate` must show a position within 750 ms; otherwise the operation returns mismatch or times out after 1.5 seconds. Caller abort, adapter destroy, route/episode/media/video/source/duration change, `loadstart`, or `emptied` removes listeners/timer and fails closed.
 
-Direct-seek propagation into Stremio UI, resume offset, seek history, and library bookkeeping remains a Phase 3 release gate. The rule semantics below preserve the Phase 0 plan, but no corresponding media-write, skip-button, auto-skip, next-episode, or keyboard-action code exists in the Phase 2 artifact.
+#### Phase 3 action state (implemented; production gate disabled)
+
+Direct-seek propagation into Stremio UI, resume offset, seek history, and library bookkeeping remains the packaged activation gate. The machinery is implemented and controlled-testable, but `PHASE3_PLAYBACK_ACTIONS_ENABLED` is the literal `false` in the installed artifact. Gate-off suppresses the action renderer and prevents both adapters from mutating anything while leaving profiles/provider/markers unchanged.
 
 For each effective segment:
 
@@ -602,34 +601,39 @@ All regions remain distinct for markers and fired state. If malformed/community 
 
 Auto-skip session state includes:
 
-- a unique session key from episode, playback-adapter instance, and stream key;
-- `firedSegmentIds`;
-- `pendingSegmentIds` while an asynchronous seek is being verified;
-- previous media time and wall-clock sample;
-- whether the current seek was initiated by ShowSkip;
-- a short post-user-seek suppression window.
+- a unique session key from action epoch, route, episode, playback-adapter/media token, exact duration, and hashed source;
+- fired, pending, and blocked-until-exit segment-ID sets plus single-flight next state;
+- previous media position and monotonic wall-clock sample, initial position, and last natural-forward result;
+- native/user seeking and the exact ShowSkip-initiated seek record;
+- 1.5-second user-seek and 500 ms verified ShowSkip-completion suppression windows.
 
 Natural-entry rule:
 
-1. Playback is not currently seeking and is not in post-user-seek suppression.
-2. Time moved forward by a plausible playback delta, rather than jumping into the segment.
-3. The previous sample was before the start and the current sample crosses or is within a small start grace. For a segment beginning at zero, a session that itself began near zero may treat its first advancing sample within that grace as natural entry; a resume into the middle does not qualify.
-4. Current time is not within the end-boundary tolerance.
-5. The segment has not fired in this session.
+1. The first valid sample only seeds state. A candidate event must be an ordinary `timeupdate`, not a seek/end/bundle/reconcile event.
+2. Playback is active, not ended/seeking, and outside both suppression windows.
+3. Wall delta is positive and at most 2.5 seconds; positive media delta is no greater than `wallDelta × playbackRate + 1.5 seconds`.
+4. The previous sample is at/before the start and the current sample lies within the 1-second start grace while still at least 750 ms before the end. A zero-start segment is armed only if the session's first sample is within opening grace.
+5. The segment is not fired, pending, or blocked. Native seek events and event-less discontinuities both suppress auto behavior. Button membership remains available after a manual seek finishes.
 
-The plugin reserves a segment in `pendingSegmentIds` before calling `adapter.seekToMs(...)`, promotes it to fired only when `mediaPositionReached` is true, and ignores the matching verified completion to prevent loops. An abort or failure clears pending state and suppresses repeated attempts until the segment is exited and naturally re-entered; it never hammers the same target each clock tick. A manual backward seek rearms a fired segment only when it moves at least 10 seconds backward and lands at or before the segment start grace after previously being near/past its end. This also supports segments that begin at zero.
+The plugin reserves exactly one action before invoking an adapter. The adapter callback marks ShowSkip seeking before assignment, so synchronous media events cannot look like a user seek. Verified success promotes the segment to fired and its completion cannot chain into an overlap. Failure clears pending and blocks that ID until exit, preventing per-tick retry hammering. Route/episode/media/source/duration change aborts pending work and resets the session; a control-bar-only remount reuses state. A manual backward seek rearms a fired segment only when it moves at least 10 seconds backward from near/past its end and lands at or before start grace. The backward jump never itself acts; a second natural traversal is required. Tiny jitter and ShowSkip seeks never rearm.
 
-Exact tolerances will be tuned with real streams in Phase 3; they must be constants with tests rather than scattered magic numbers.
+All tolerances are centralized in `PLAYBACK_ACTION_LIMITS` and covered by dependency-free tests. Packaged validation may justify a later reviewed tuning change.
 
 ### 6.8 Next-episode semantics
 
 - `atCredits`: request native next once on natural entry to the earliest valid credits region. If no next video/capability exists, leave playback alone.
-- `afterCredits`: require a proven post-credit-safe endpoint. In current TheIntroDB v3, only an accepted credits/preview `end_ms: null` explicitly means media end; after a positive actual duration is known, transition at a small natural end-of-media tolerance. The latest finite credits/preview boundary does **not** prove completeness or that no post-credit content follows, so finite-only data fails closed for automatic next. A future provider completeness signal needs separate validation before it can broaden this rule.
+- `afterCredits`: require `ended`, a position within 1 second of live duration, prior natural-forward evidence, and an accepted **credits** `end_ms: null` normalized to that duration. Finite credits and terminal preview alone are insufficient.
 - `button`: offer a ShowSkip next-episode button during credits when a next video exists.
 - `stremio`: make no next-episode UI or transition and leave native Stremio behavior untouched.
 - `never`: disable every ShowSkip next action/button. It does not intercept Stremio's own `ended` behavior because doing so would require invasive host patches.
 
-If `nextEpisode: atCredits` and `credits: auto` become eligible at the same time, next episode wins. If a next transition cannot be performed safely, the normal credits rule may proceed.
+If `nextEpisode: atCredits` and `credits: auto` become eligible at the same time, a genuinely available next action wins. If availability/driver proof is absent, normal credits arbitration may proceed. Production currently has no next driver, so every ShowSkip next mode is a safe no-op even beyond the global false gate.
+
+### 6.9 Release-gate activation process
+
+The production control is exactly `const PHASE3_PLAYBACK_ACTIONS_ENABLED = false;`. It is not represented in `state_v1` and has no settings, environment, URL, DOM, or network input. `ShowSkipPlugin` passes it to `PlayerController`; the controller passes the capability into `PlaybackActionStateMachine`, `PlayerActionRenderer`, `HtmlMediaAdapter`, and `NextEpisodeAdapter`. Outer coordination and final mutation boundaries both refuse gate-off work.
+
+Activation requires a dedicated validation branch from the completed Phase 3 commit. First install/hash-check the false build. Then change only the literal to true in a temporary local build, rerun the full suite/static/security checks, install/hash-check it, and execute the README's consolidated Phase 2 + 3 packaged matrix with exact runtime versions recorded. That temporary build is not distributable. A separately implemented compound next driver must pass its own availability, one-transition, stale-route, and failure matrix; the literal alone does not enable next. Only after all applicable checks pass may a distinct reviewed activation commit intentionally retain `true`. Any failure restores/reinstalls `false` and leaves the capability unavailable.
 
 ## 7. Teardown contract
 
@@ -639,8 +643,8 @@ If `nextEpisode: atCredits` and `credits: auto` become eligible at the same time
 2. Cancel animation frames and timeouts.
 3. Disconnect document, loader-script, and panel-resize observers.
 4. Remove `hashchange`, page lifecycle, window, slider, player-container, playback-adapter, and video listeners.
-5. Remove marker overlay, tooltip, panel, launcher, and owned styles; Phase 2 has no skip/next buttons.
-6. Clear in-memory provider results, attribution-use flags, current contexts, and duration state.
+5. Remove marker overlay, tooltip, panel, launcher, playback-action root/button, and owned styles.
+6. Clear in-memory provider results, attribution-use flags, action fired/pending/blocked/suppression state, current contexts, and duration state.
 7. Delete `window.__showSkipPlugin` only if it still refers to this instance.
 
 No code may use untracked permanent intervals.
@@ -657,7 +661,7 @@ No code may use untracked permanent intervals.
 - Bound provider bodies to 256 KiB and collections to 64 records per documented type before rendering or caching.
 - Abort stale requests so a prior episode cannot mutate the current player.
 - Never persist TheIntroDB timestamp responses.
-- Phase 2 contains no `currentTime` assignment, seek method, playback mutation, skip/next control, synthetic player keyboard action, API-key path, analytics, or telemetry.
+- Phase 3 contains exactly one guarded `currentTime` assignment inside `HtmlMediaAdapter`; production coordination and the adapter both receive a literal false gate, so the installed artifact cannot reach it. There is no host dispatch, route/deep-link construction, native-control click, synthetic keyboard action, API-key path, analytics, or telemetry.
 - Use `textContent` and created DOM nodes for dynamic labels; do not interpolate provider data into HTML.
 
 ## 9. Known fragility and mitigations
@@ -671,7 +675,7 @@ No code may use untracked permanent intervals.
 | Inactive route DOM remains mounted | Source-verified router retention and live detail→player check | Parsed hash is authoritative; route-scoped roots; tear down prior controller even while its host DOM stays connected |
 | Seek and volume share slider classes | Live-verified | Scope through player → control bar → seek bar; accept release/direct or source/dev wrapper form only after exact native layer proof |
 | Player implementation may not expose `<video>` | Source selection includes YouTube, Chromecast, external, and shell paths; live trailer produced iframe | Capability adapter; require a connected HTML video under the active Enhanced player for Phase 2; otherwise fail closed |
-| Core state is mistaken for a media clock/seek surface | Current player types and `Player.js` separate core bookkeeping from private video control | Use core only for validated identity; Phase 2 time comes from `HtmlMediaAdapter`, and seek remains absent |
+| Core state is mistaken for a media clock/seek surface | Current player types and `Player.js` separate core bookkeeping from private video control | Use core only for validated identity; media time and the gated seek capability stay confined to `HtmlMediaAdapter` |
 | Duration starts invalid, changes, or jitters | HTML media behavior; live torrent began with unknown duration | Wait for finite positive duration and a 750 ms quiet window; exact-duration keys; maximum two distinct lookups per media-source/context token |
 | `window.services` may be unavailable during player | Ordinary web live check; Enhanced preload comments; official plugin polling | Capture only validated bound reads; strict route fallback is repeatedly revalidated, and any later conflict clears work |
 | Core state shape changes | Internal host API, not part of scoped plugin API | Defensive shape guards, route cross-check, no guessed context |
@@ -679,14 +683,14 @@ No code may use untracked permanent intervals.
 | Disable does not invoke teardown | Enhanced loader source | Singleton cleanup, loader-node observer, page lifecycle cleanup, reload fallback |
 | API ID resolution can be inaccurate | TheIntroDB OpenAPI says TMDB is canonical and IMDb/TVDB mapping adds latency/risk | Prefer verified TMDB when available; otherwise IMDb; never label arbitrary Stremio numeric IDs as TMDB |
 | Release offsets differ | Product requirement and TheIntroDB `duration_ms` contract | Send the exact live rounded duration, isolate exact-duration bundles, and leave the correction hook deferred |
-| Incorrect timestamps could affect future actions | Provider terms and community data | Phase 2 is visual/read-only; conservative validation and button defaults remain future Phase 3 safeguards |
+| Incorrect timestamps could affect playback actions | Provider terms and community data | Production actions remain release-gated; strict validation, forward-only seeks, button defaults, and packaged activation checks limit risk |
 | API/data terms change | Live service terms | Link attribution, session-only cache, re-review terms before release |
 
 ## 10. Validation evidence and required live matrix
 
-Phase 2 has 61 passing dependency-free Node tests across the existing Phase 1/1.1 suite and `tests/showskip-phase2.test.cjs`. Public Stremio Web was inspected read-only on 2026-08-20: the current trailer player retained three route containers, with exactly one active player, one YouTube iframe, zero videos, one seek bar, and two generic sliders including volume. No ShowSkip marker layer appeared. The observed generated tokens (`player-container-wIELK`, `seek-bar-I7WeY`, `seek-bar-container-JGGTa`, and the seek/volume-shared `slider-container-nJz5F`) are recorded only as evidence, never hard-coded. This validates the need for route/player/seek structural scoping and confirms the trailer path fails closed. A separate local HTTP marker harness was blocked by the app browser's security policy and is not claimed as passed.
+The current dependency-free suite has 83 tests across Phase 1/1.1, Phase 2, and controlled gate-off/gate-on Phase 3 behavior; exact final results are recorded in section 16. Public Stremio Web was inspected read-only on 2026-08-20 and again on 2026-09-05: the current trailer player retained three route containers, with exactly one active player, one YouTube iframe, zero videos, one seek bar, and two generic sliders including volume. No ShowSkip marker or action layer appeared. The observed generated tokens (`player-container-wIELK`, `seek-bar-I7WeY`, `seek-bar-container-JGGTa`, and the seek/volume-shared `slider-container-nJz5F`) are recorded only as evidence, never hard-coded. This validates the need for route/player/seek structural scoping and confirms the trailer path fails closed. A separate local HTTP marker harness was blocked by the app browser's security policy and is not claimed as passed.
 
-No Phase 2 run inside packaged Stremio Enhanced is claimed. After the final source is installed and its SHA-256 matches the source artifact, the Phase 2 rows below—and the short exact checklist in `README.md`—remain manual acceptance work with a real built-in series stream.
+No packaged Stremio Enhanced Phase 2 timeline or Phase 3 action run is claimed. After the final gate-off source is installed and its SHA-256 matches the source artifact, the rows below—and the consolidated checklist in `README.md`—remain manual acceptance work with a real built-in series stream.
 
 The following must be completed in installed Stremio Enhanced, not ordinary Stremio Web:
 
@@ -702,7 +706,7 @@ The following must be completed in installed Stremio Enhanced, not ordinary Stre
 | Desktop, narrow window, fullscreen transitions | 1/2 | Launcher/panel/markers remain usable and do not cover native controls |
 | Packaged Enhanced runtime/build probe | 2 | Versions recorded; no `chrome.webview`; core shapes/cadence documented without assuming live globals persist |
 | Built-in Enhanced HTML series stream | 2 | Source inference is confirmed; exactly one active-player video is selected; route/state agree; one bounded exact-duration request produces only seek-bar markers and no playback mutation |
-| Direct-seek propagation | 3 | A future explicit seek reaches the target and Stremio UI/resume/history follow; this remains a Phase 3 release gate and has no Phase 2 implementation |
+| Direct-seek propagation | 3 activation | In a temporary gate-on validation build, one adapter seek reaches the target and Stremio UI/resume/history follow; the committed/installed Phase 3 artifact remains gate-off until proven |
 | Multiple/stale videos, trailer, casting, or external-player path | 2 | Only the active route's connected media is eligible; unsupported medium or backed-out external route fails closed without a wrong fetch, marker, or playback action |
 | Episode change without reload | 2 | Old request aborted; old markers/listeners removed; new bundle rendered |
 | Provider envelope identity mismatch | 2 | Wrong type, any mismatching returned season/episode, or canonical TMDB mismatch is rejected and never cached/rendered; schema-valid omitted season/episode relies on the exact request/context token |
@@ -715,7 +719,7 @@ The following must be completed in installed Stremio Enhanced, not ordinary Stre
 | Manual seek into middle/end boundary | 3 | No unintended auto-skip; button mode still behaves predictably |
 | Deliberate backward seek | 3 | Rearm only under documented threshold; no loop |
 | Multiple credits with a post-credit gap and preview | 3 | Finite-only data makes `afterCredits` a safe no-op; an accepted terminal null end waits for actual end-of-media tolerance |
-| Native next available/unavailable | 3 | Availability has validated core state or an unambiguous native control; a verified host action or enabled-after-test synthetic `Shift+N` performs exactly one core-aware transition; otherwise safe no-op, never a guessed route |
+| Native next available/unavailable | 3 activation | A future driver must prove authoritative availability and one complete core-bookkeeping plus router transition; otherwise safe no-op. Raw dispatch, title-only DOM controls, synthetic shortcuts, and guessed routes are rejected |
 | Disable while active | 1/3 | Exact loader-node removal triggers idempotent owned cleanup when supported; reload is the verified fallback |
 | Uninstall while active, then reload | 4 | Running instance may persist until reload; afterward plugin/UI are absent while `ShowSkip.plugin.json` is intentionally retained |
 | Host update while active, then reload | 4 | Running code remains the old version until reload; new version starts once with no duplicate singleton |
@@ -725,16 +729,16 @@ The following must be completed in installed Stremio Enhanced, not ordinary Stre
 
 1. **Enhanced runtime core bridge:** Which page-world shape is actually stable during Enhanced playback—direct `core.getState`, `services.core.getState`, or `services.core.transport.getState`—and what exact ready-state data is returned in 1.2.0?
 2. **Enhanced media path:** Pinned source implies built-in Enhanced playback selects HTMLVideo, but this must be confirmed with a real series stream through the configured local backend; unsupported YouTube/cast/external paths intentionally fail closed.
-3. **Enhanced runtime next control:** Does synthetic `Shift+N` invoke exactly one native transition in Enhanced, including core seek-history/library updates, and is an unambiguous native button available as fallback when controls are mounted?
+3. **Enhanced next capability:** Which stable plugin-accessible operation, if any, can perform the complete core-bookkeeping plus validated-router transition? Current raw dispatch, title-only native control, guessed deep links, and synthetic shortcuts are all rejected.
 4. **Series DOM across layouts/themes:** Basic insertion and rendering in packaged Enhanced are user-confirmed. The chosen append target still needs the full default/popular-theme and desktop/narrow-width matrix.
 5. **TMDB identity:** Current series routes commonly use IMDb IDs. Which reliable core/meta field, if any, exposes canonical TMDB IDs without another metadata service? Until verified, use IMDb and never reinterpret arbitrary numeric IDs.
 6. **Authored metadata:** Confirm final `@author`, public source URL, and project license before release. `@updateUrl` remains `none` unless the user explicitly changes the remote-code policy.
 7. **Distribution model:** TheIntroDB timestamp terms permit client-side non-commercial use. Any commercial or bundled paid distribution requires a separate agreement.
 8. **`never` wording:** The proposed meaning disables ShowSkip next behavior but does not attempt to defeat native Stremio end-of-video behavior. Confirm if future product intent requires a more invasive native suppression mode.
-9. **Post-credit-safe endpoint:** TheIntroDB has no completeness/final-region safety flag, and a latest finite credits/preview boundary is insufficient. The proposed Phase 3 `afterCredits` behavior can use only a valid terminal null end resolved against actual duration; any future broader criterion requires provider evidence and real multi-region validation.
+9. **Post-credit-safe endpoint:** TheIntroDB has no completeness/final-region safety flag, and a latest finite credits/preview boundary is insufficient. Implemented `afterCredits` requires actual media `ended` plus a credits null end resolved against duration; packaged validation and any future broader criterion still require evidence.
 10. **Distinct post-credit data:** TheIntroDB v3 does not expose post-credit scenes separately. A future provider that does will need a new normalized type plus an explicit profile-schema/UI migration; ShowSkip does not reserve or infer it from `preview` in production.
 
-None of these blocks Phase 1's per-show profile UI or the fail-closed Phase 2 implementation. Questions 1–5 remain packaged-runtime constraints and block broader support or Phase 3 playback actions until verified.
+None of these blocks Phase 1's per-show profile UI, Phase 2 markers, or the gate-off Phase 3 artifact. Questions 1–4 and 9 remain packaged activation constraints; question 3 also blocks wiring any production next driver.
 
 ## 12. Exact Phase 1–4 plan and status
 
@@ -763,15 +767,16 @@ None of these blocks Phase 1's per-show profile UI or the fail-closed Phase 2 im
 - Keep skip and next actions nonfunctional in this phase.
 - Commit the completed implementation after automated/static checks, final install/hash verification, and documentation; report the packaged manual gate without claiming it was automated.
 
-### Phase 3 — skip behavior and next episode
+### Phase 3 — skip behavior and next episode (implemented behind disabled gate; packaged activation pending)
 
-- Validate direct-seek propagation into Stremio UI/resume/history in packaged Enhanced; keep every skip action disabled unless this release gate passes.
-- Add native-looking segment skip buttons for `button` mode.
-- Add conservative, once-per-session auto-skip with seek-loop guard, manual-seek suppression, tolerances, and backward rearm.
-- Implement next-episode state semantics and precedence.
-- Live-validate the core-aware next capability and synthetic `Shift+N` path, with unambiguous native-control fallback only if necessary.
-- Test multiple/overlapping segments, null ends, post-credit gaps, previews, absent next episodes, and Stremio default/never modes.
-- Commit after Phase 3 acceptance criteria pass.
+- Implement the explicit literal release gate and pass it to coordination, UI, seek, and next boundaries without changing `state_v1`.
+- Add a context-bound, seekable-range-checked, bounded, verified `HtmlMediaAdapter.seekToMs` as the sole position write.
+- Add one accessible player-anchored action renderer for `button` mode, suppressed entirely while gate-off.
+- Add conservative natural-entry inference, manual/discontinuous-seek suppression, ShowSkip-seek recognition, single-flight/fired/blocked state, loop protection, and 10-second backward rearm.
+- Preserve overlapping segment identities and choose one action by next precedence, earliest end, stable type, then ID.
+- Implement all next-mode semantics behind an injectable adapter; leave production capability unavailable because current source exposes no safe plugin-scoped compound transition.
+- Preserve all Phase 1/1.1/2 tests and add controlled gate-on action/adapter/DOM/lifecycle coverage.
+- Install and commit only the production gate-off artifact; defer the consolidated packaged Enhanced Phase 2 + 3 matrix and any activation to a separate step.
 
 ### Phase 4 — hardening and release
 
@@ -794,7 +799,7 @@ None of these blocks Phase 1's per-show profile UI or the fail-closed Phase 2 im
 - Seek markers always render independently and are scoped through the actual seek bar.
 - Event-driven reconciliation and explicit teardown; no permanent polling loop.
 - Playback defaults remain buttons, making timestamp errors recoverable.
-- Next episode uses only confirmed current state plus a live-validated host action, `Shift+N` shortcut, or unambiguous native control; it never guesses the next route.
+- The Phase 0 next-episode candidates required later proof. Phase 3 research rejected raw dispatch, `Shift+N`, title-only DOM controls, and guessed routes; production remains unavailable until a complete core-aware host driver is proven.
 - Built-in Enhanced playback is expected to expose HTMLVideo, but the controller is capability-based and unsupported player implementations safely no-op.
 
 ## 14. Phase 1 implementation record
@@ -826,14 +831,14 @@ On 2026-08-20, read-only validation against the live public Stremio Web series d
 
 ## 15. Phase 2 implementation record
 
-Phase 2 advances the standalone artifact to `0.2.0` without changing `state_v1`. It adds episode identity, read-only media observation, duration stabilization, one hardened provider, and behavior-independent native-timeline markers. Phase 1 choices remain visible and persistent but inert: the production file has no media write, skip/next button, automatic rule, next-episode transition, or synthetic player keyboard action.
+At commit `43260064edcc111ad0d8d993163d35f8138d497e`, Phase 2 advanced the standalone artifact to `0.2.0` without changing `state_v1`. It added episode identity, read-only media observation, duration stabilization, one hardened provider, and behavior-independent native-timeline markers. At that historical commit the Phase 1 choices were inert and the file had no media-write/action code; section 16 records the later gate-off Phase 3 additions.
 
 ### 15.1 Episode, media, and stale-work lifecycle
 
 - `ContextDetector` recognizes strict eligible series-player routes separately from ineligible short trailer/player routes. `EpisodeIdentityProvider` keeps route parsing independent of both media observation and networking.
 - `CoreStateReader` captures bound reads from known current/retained core shapes. A ready state must agree with route meta, season, episode, and any present selected/library IDs. Loading state defers; contradiction invalidates route-only work; a later match promotes it. The active route signature is rechecked after reads.
 - Current provider eligibility is intentionally narrower than profile identity: only exact 7/8-digit IMDb IDs are emitted. No arbitrary Stremio ID becomes a TMDB/TVDB ID.
-- The active media resolver follows only the last route container through one visible player and video host to exactly one connected visible `<video>`. `HtmlMediaAdapter` reads snapshots/events and advertises `canSeek: false`; it exposes no playback mutation method.
+- The active media resolver follows only the last route container through one visible player and video host to exactly one connected visible `<video>`. In the historical Phase 2 artifact `HtmlMediaAdapter` was observation-only; Phase 3 extends this same boundary without changing resolver scope.
 - Duration must round to a positive safe integer and remain unchanged for 750 ms. Episode, video, or source changes reset its scope; at most two distinct exact durations can issue per scope. Episode/media counters plus live route, video, source, and duration checks reject late identity/provider results.
 
 ### 15.2 TheIntroDB provider and data handling
@@ -854,7 +859,7 @@ Phase 2 advances the standalone artifact to `0.2.0` without changing `state_v1`.
 
 ### 15.4 Verification, live gate, and evidence-backed deviations
 
-`node --check ShowSkip.plugin.js` and `node --test tests/*.test.cjs` pass; the combined dependency-free suite contains 61 tests. Phase 2 coverage includes eligible/ineligible routes, core match/conflict/loading/retained readers, media ambiguity/replacement/read-only behavior, duration jitter/source reset/two-key cap, exact provider URLs and cache separation, sentinel/envelope/range/body-size validation, timeout/abort/deduplication/retry/daily-limit behavior, seek-versus-volume structure, marker geometry/accessibility/focus/remount/cleanup, stale completions, and a production-source prohibition check for Phase 3 actions. The 26 Phase 1/1.1 regression tests remain in that total.
+Phase 2 completed with 61 passing dependency-free tests. That historical coverage includes eligible/ineligible routes, core match/conflict/loading/retained readers, media ambiguity/replacement/read-only behavior, duration jitter/source reset/two-key cap, exact provider URLs and cache separation, sentinel/envelope/range/body-size validation, timeout/abort/deduplication/retry/daily-limit behavior, seek-versus-volume structure, marker geometry/accessibility/focus/remount/cleanup, stale completions, and the then-valid prohibition on Phase 3 writes. Phase 3 retains and updates those assertions; current totals are in section 16.
 
 Read-only current public-web inspection confirmed the release player/control/seek hierarchy, shared seek/volume slider class, four native layers, and the need for last-route scoping. A live trailer player had three retained route containers, one active player, one iframe, zero videos, one seek bar, two generic sliders including volume, and zero marker layers—an expected fail-closed result. The generated suffixes are not production selectors. A further local HTTP marker-harness run was blocked by the app browser's security policy and is not reported as passed.
 
@@ -862,9 +867,44 @@ Phase finalization copies the exact finished artifact with `scripts/install-loca
 
 Implemented deviations/refinements from the Phase 0 proposal are deliberate:
 
-- `HtmlVideoAdapter` became read-only `HtmlMediaAdapter`, with `canSeek: false` and no future-looking seek methods, so Phase 2 cannot accidentally control playback.
+- `HtmlVideoAdapter` became observation-only `HtmlMediaAdapter` in Phase 2. Phase 3 later adds its disabled-by-default mutation capability at that same boundary rather than scattering writes.
 - The proposed `aria-hidden` timeline was replaced by an accessible group of focusable markers; pointer transparency still preserves native seeking, and hidden controls use CSS visibility to remove focus stops.
 - Seek discovery supports both the observed release direct-slider DOM and the pinned source/development wrapper, but only after validating the same native track/thumb structure.
 - The runtime normalized vocabulary contains only the four TheIntroDB types. The richer Phase 0 timing/correction/post-credits model remains deferred rather than inventing unsupported provider meaning or persisting raw data.
 - Attribution is driven by actual rendered-marker use and remembered only per show for the current plugin session, rather than appearing merely because a provider request occurred.
 - Percent geometry plus document reconciliation replaces the proposed timeline `ResizeObserver`; no pixel geometry is cached, and a remounted slider receives a fresh owned layer from the valid session bundle.
+
+## 16. Phase 3 implementation record
+
+Phase 3 advances the standalone artifact to `0.3.0` and leaves `state_v1`, defaults, provider validation, cache policy, timeline rendering, attribution, and install/uninstall scripts unchanged. The production artifact contains the complete segment-action architecture but is intentionally inert for playback mutation because `PHASE3_PLAYBACK_ACTIONS_ENABLED` is the literal `false`.
+
+### 16.1 Defense-in-depth gate and action context
+
+- The gate is internal code, not a preference. It has no remote, environment, storage, URL, or network source. Saved Auto/Button/Off and next values remain visible/persistent while runtime action is suppressed.
+- `ShowSkipPlugin` passes the literal to `PlayerController`; separate constructor capabilities flow into state, renderer, seek adapter, and next adapter. The controller never loads an action profile or constructs an action context while gate-off; the adapters also independently refuse mutation.
+- Markers remain provider/data driven and receive neither profile nor gate. The configured Off mode therefore never hides a valid marker.
+- Action proof is deliberately stronger than Phase 2 display identity. It requires `identitySource: route+core` and captures action epoch, current route signature, canonical episode key, episode/media tokens, exact adapter/video references, unredacted source equality, and exact rounded duration. Every action re-resolves the current route and active video, checks the current bundle episode/duration, then passes that exact proof object to its adapter.
+- Route exit, identity conflict, video detach/replacement, source/duration change, provider failure/limit, and teardown synchronously clear the one-button renderer/state and abort pending work. A control-bar-only remount does not reset fired state.
+
+### 16.2 Seek, state, arbitration, and UI
+
+- `HtmlMediaAdapter.seekToMs` implements the validation/completion contract in section 6.7. It is the only `.currentTime =` occurrence in production source. No core dispatch, progress-bar simulation, pointer drag, React inspection, or keyboard action exists.
+- `PlaybackActionStateMachine` separates temporal inference from DOM/media mutation. Its first observation seeds only. Native `seeking`/`seeked` and implausible deltas both suppress automatic entry; manual button membership is independent once the seek finishes. Adapter start marks the matching ShowSkip seek before assignment, and only verified completion fires it.
+- Successful segments are once-per-pass. Failed attempts block until exit. A fired segment rearms only on a non-ShowSkip backward jump of at least 10,000 ms from near/past its end to at/before 1,000 ms start grace, followed by another natural traversal.
+- Overlapping regions are never merged. The single automatic or button intent is chosen by available next first, then earliest end, stable `recap → intro → credits → preview` type order, then lexical ID. A reserved/pending action prevents parallel mutation and completion cannot chain an overlap.
+- `PlayerActionRenderer` mounts one owned pointer-transparent root as a child of the structurally validated active player. The native `<button type="button">` has visible and ARIA-identical `Skip Recap`, `Skip Intro`, `Skip Credits`, `Skip Preview`, or `Next Episode` text, 44 px minimum size, focus styling, and one-shot double-click protection. Signature and click-time guards include the action session and exact candidate. Stale/remounted/removed controls lose their listener and cannot act. Gate-off renders no disabled-looking control.
+
+### 16.3 Next episode
+
+- `atCredits` produces one candidate only on natural entry into credits and only if the adapter proves a next episode and usable mechanism.
+- `afterCredits` produces one candidate only on the actual media `ended` event, near live duration, after natural-forward evidence, with terminal credits sentinel proof. A finite credits end and terminal preview are rejected.
+- `button` requires current credits membership plus the same verified availability/mechanism. `stremio` and `never` produce no ShowSkip next action; `never` does not suppress native autoplay.
+- The production `NextEpisodeAdapter` is intentionally constructed without availability or transition functions, so all these modes fail closed. Current sources prove native next is a compound core-dispatch plus router operation, while Enhanced exposes no stable scoped API and the native DOM control lacks a stable semantic identity. Tests use only an injected fake driver.
+
+### 16.4 Verification and deferred packaged gate
+
+The final dependency-free suite contains 83 passing tests: the preserved 26 Phase 1/1.1 tests, 35 Phase 2 tests, and 22 Phase 3 tests. Phase 3 covers disabled/enabled test capabilities, valid/edge/gap/invalid seeks, stale context/source/video/duration, completion/timeupdate/mismatch/timeout/abort/destroy/single-flight, natural/resume/manual/discontinuous entry, zero-start and long-gap behavior, ShowSkip recognition, once-only/failed action state, 10-second rearm, overlap precedence, all saved segment/next modes, terminal credits proof, unavailable/failing next adapters, accessible one-button ownership, duplicate/control/player remount cleanup, session replacement, marker independence, and source security invariants.
+
+On 2026-09-05, the public Stremio Web Breaking Bad trailer was inspected read-only in the in-app browser. It again had three retained route containers, one active player, one control bar, one seek bar, two generic sliders, one iframe, zero top-level `<video>` elements, zero ShowSkip action buttons, and zero ShowSkip markers. This validates the current unsupported-media fail-closed assumption and reconfirms why neither generic slider nor localized/title-only controls are safe action targets. It does not validate the local plugin inside packaged Enhanced, direct seeking, native bookkeeping, or episode transitions.
+
+The completed gate-off source is installed only through `scripts/install-local.ps1`, and source/installed SHA-256 equality is recorded in the completion report. The README contains the one consolidated future Phase 2 + Phase 3 packaged checklist and exact temporary-validation/separate-activation procedure. No packaged Enhanced action validation is claimed, and Phase 4 has not begun.
