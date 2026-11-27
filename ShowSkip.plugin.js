@@ -3648,29 +3648,36 @@
             [data-showskip-launcher] {
                 appearance: none;
                 box-sizing: border-box;
-                width: 4rem;
-                height: 4rem;
-                min-width: 44px;
+                position: fixed;
+                left: 0;
+                right: 0;
+                bottom: max(1.25rem, env(safe-area-inset-bottom));
+                z-index: 9999;
+                width: fit-content;
                 min-height: 44px;
-                display: inline-grid;
-                place-items: center;
-                flex: 0 0 auto;
-                margin: 0 0 1rem;
-                padding: 0;
-                border: 1px solid rgba(255, 255, 255, 0.18);
-                border-radius: 1.1rem;
-                color: var(--primary-foreground-color, rgba(255, 255, 255, 0.92));
-                background: var(--overlay-color, rgba(28, 28, 36, 0.66));
-                box-shadow: 0 0.4rem 1.2rem rgba(0, 0, 0, 0.16);
+                margin: 0 auto;
+                padding: 0.6rem 1.15rem 0.6rem 0.95rem;
+                display: inline-flex;
+                align-items: center;
+                gap: 0.55rem;
+                border: 1px solid rgba(127, 227, 236, 0.35);
+                border-radius: 999px;
+                color: #f4f6f8;
+                background: rgba(18, 22, 29, 0.92);
+                box-shadow: 0 0.5rem 1.6rem rgba(0, 0, 0, 0.5);
                 cursor: pointer;
                 font: inherit;
-                transition: background-color 120ms ease, transform 120ms ease, border-color 120ms ease;
-                backdrop-filter: blur(10px);
+                font-size: 0.9rem;
+                font-weight: 650;
+                line-height: 1;
+                white-space: nowrap;
+                transition: background-color 140ms ease, border-color 140ms ease;
+                backdrop-filter: blur(12px);
             }
-            [data-showskip-launcher]:hover {
+            [data-showskip-launcher]:hover,
+            [data-showskip-launcher][aria-expanded="true"] {
                 background: #0d7a86;
                 border-color: rgba(127, 227, 236, 0.6);
-                transform: translateY(-1px);
             }
             [data-showskip-launcher]:focus-visible {
                 outline: 2px solid var(--primary-accent-color, #9c7cff);
@@ -3685,8 +3692,9 @@
                 outline-offset: 3px;
             }
             [data-showskip-launcher] svg {
-                width: 1.65rem;
-                height: 1.65rem;
+                width: 1.3rem;
+                height: 1.3rem;
+                flex: 0 0 auto;
                 fill: currentColor;
             }
             [data-showskip-panel] {
@@ -3963,12 +3971,6 @@
                     font-size: 0.7rem;
                 }
             }
-            @media screen and (max-width: 1000px) and (max-height: 500px) and (orientation: landscape) {
-                [data-showskip-launcher] {
-                    width: 3rem;
-                    height: 3rem;
-                }
-            }
             @media (prefers-reduced-motion: reduce) {
                 [data-showskip-launcher] {
                     transition: none;
@@ -4008,8 +4010,10 @@
         }
 
         activate(context, profile, attributionVisible = false) {
-            const actionRow = resolveActiveActionRow(this.document);
-            if (!actionRow) {
+            // The launcher is a floating pill on document.body, so it does not depend on
+            // Stremio's internal action-row markup (which varies between versions).
+            const host = this.document.body;
+            if (!host) {
                 this._removePresentation();
                 this.context = context;
                 this.profile = profile;
@@ -4019,7 +4023,7 @@
             const contextChanged = !this.context || this.context.showKey !== context.showKey;
             const launcherInvalid = !this.launcher
                 || !this.launcher.isConnected
-                || this.launcher.parentNode !== actionRow;
+                || this.launcher.parentNode !== host;
             if (contextChanged && this.context) {
                 this.mutationRevision += 1;
             }
@@ -4030,16 +4034,24 @@
             this.context = context;
             this.profile = profile;
             this.attributionVisible = attributionVisible === true;
-            this.actionRow = actionRow;
+            this.actionRow = null;
 
-            const result = ensureSingleOwnedNode(
-                actionRow,
-                Array.from(this.document.querySelectorAll(LAUNCHER_SELECTOR)),
-                this.launcher,
-                () => this._createLauncher(),
-            );
-            this.launcher = result.node;
-            if (result.created) {
+            let created = false;
+            if (!this.launcher || !this.launcher.isConnected || this.launcher.parentNode !== host) {
+                for (const stale of this.document.querySelectorAll(LAUNCHER_SELECTOR)) {
+                    removeNode(stale);
+                }
+                this.launcher = this._createLauncher();
+                host.appendChild(this.launcher);
+                created = true;
+            } else {
+                for (const stale of this.document.querySelectorAll(LAUNCHER_SELECTOR)) {
+                    if (stale !== this.launcher) {
+                        removeNode(stale);
+                    }
+                }
+            }
+            if (created) {
                 this._listen(this.launcher, "click", () => this._openPanelFromLauncher());
             }
 
@@ -4092,6 +4104,10 @@
             button.setAttribute("title", "ShowSkip settings");
             button.setAttribute("aria-expanded", "false");
             button.appendChild(createSvgIcon(this.document));
+            const label = this.document.createElement("span");
+            label.className = "showskip-launcher-label";
+            label.textContent = "ShowSkip settings";
+            button.appendChild(label);
             return button;
         }
 
