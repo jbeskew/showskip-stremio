@@ -981,6 +981,29 @@
         return rows.length > 0 ? rows[rows.length - 1] : null;
     }
 
+    // Class-name independent fallback: find the visible "Trailer" button and use its row.
+    function resolveRowByTrailerLabel(documentObject) {
+        if (!documentObject || typeof documentObject.querySelectorAll !== "function") {
+            return null;
+        }
+        const labels = Array.from(documentObject.querySelectorAll("div, span, a, button, p"))
+            .filter((element) => element.children.length === 0
+                && (element.textContent || "").trim().toLowerCase() === "trailer"
+                && element.isConnected !== false
+                && !element.closest("[data-showskip-owned]"));
+        for (const label of labels.reverse()) {
+            let node = label;
+            while (node && node.parentElement && node.parentElement !== documentObject.body) {
+                const parent = node.parentElement;
+                if (parent.children.length >= 4) {
+                    return { row: parent, template: node };
+                }
+                node = parent;
+            }
+        }
+        return null;
+    }
+
     function findNativeButtonTemplate(row) {
         const children = Array.from(row.children).filter((child) => !child.hasAttribute("data-showskip-owned"));
         const labelled = children.find((child) => /trailer/iu.test(child.textContent || ""));
@@ -4038,8 +4061,13 @@
         activate(context, profile, attributionVisible = false) {
             // The launcher is a floating pill on document.body, so it does not depend on
             // Stremio's internal action-row markup (which varies between versions).
-            const row = resolveActiveActionRow(this.document) || resolveLooseActionRow(this.document);
-            const template = row ? findNativeButtonTemplate(row) : null;
+            let row = resolveActiveActionRow(this.document) || resolveLooseActionRow(this.document);
+            let template = row ? findNativeButtonTemplate(row) : null;
+            if (!row || !template) {
+                const byLabel = resolveRowByTrailerLabel(this.document);
+                row = byLabel ? byLabel.row : null;
+                template = byLabel ? byLabel.template : null;
+            }
             const mode = row && template ? "row" : "floating";
             const host = mode === "row" ? row : this.document.body;
             if (!host) {
