@@ -31,7 +31,7 @@ To update, pull or re-download the repo and run the install script again. To rem
 
 ### Keep your keys out of the repo
 
-There are no secrets in this repo and none are needed. Never commit debrid or API keys (TorBox and so on), `.env` files, or the generated `ShowSkip.plugin.json` settings file. `.gitignore` already blocks them.
+There are no secrets in this repo and none are needed. Never commit debrid or API keys, `.env` files, or the generated `ShowSkip.plugin.json` settings file. `.gitignore` already blocks them.
 
 ## Features
 
