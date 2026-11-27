@@ -2975,10 +2975,18 @@
                 if (this.tooltip.textContent !== text) {
                     this.tooltip.textContent = text;
                 }
-                if (this.tooltip.style.left !== left) {
-                    this.tooltip.style.left = left;
-                }
                 this.displayedTooltipKey = key;
+            }
+            // Fixed positioning keeps the tooltip from being clipped by the player's overflow rules.
+            const layerRect = this.layer && typeof this.layer.getBoundingClientRect === "function"
+                ? this.layer.getBoundingClientRect()
+                : null;
+            if (layerRect && layerRect.width > 0) {
+                const anchorX = layerRect.left + (layerRect.width * (item.leftPercent + (item.widthPercent / 2))) / 100;
+                this.tooltip.style.left = `${Math.round(anchorX)}px`;
+                this.tooltip.style.top = `${Math.round(layerRect.top + (layerRect.height / 2) - 14)}px`;
+            } else {
+                this.tooltip.style.left = left;
             }
             if (this.tooltip.hidden) {
                 this.tooltip.hidden = false;
@@ -3923,8 +3931,8 @@
                 outline-offset: 1px;
             }
             [data-showskip-timeline-tooltip] {
-                position: absolute;
-                bottom: calc(50% + 0.72rem);
+                position: fixed;
+                z-index: 10001;
                 max-width: min(18rem, 70vw);
                 padding: 0.28rem 0.46rem;
                 border: 1px solid rgba(255, 255, 255, 0.12);
@@ -3936,7 +3944,7 @@
                 line-height: 1.25;
                 white-space: nowrap;
                 pointer-events: none;
-                transform: translateX(-50%);
+                transform: translate(-50%, -100%);
             }
             [data-showskip-timeline-tooltip][hidden] {
                 display: none;
