@@ -1004,8 +1004,42 @@
         return null;
     }
 
+    function isRenderedElement(element) {
+        if (!element || element.isConnected === false) {
+            return false;
+        }
+        return typeof element.getClientRects !== "function" || element.getClientRects().length > 0;
+    }
+
+    // Current Stremio Web detail hero: .actions-* > .secondary-* holds Trailer, the
+    // library/watched group, the like/love group and the round Share button.
+    function resolveHeroActionRow(documentObject) {
+        if (!documentObject || typeof documentObject.querySelectorAll !== "function") {
+            return null;
+        }
+        const rows = descendantsWithModuleClass(documentObject, "secondary")
+            .filter((row) => hasModuleClass(row.parentElement, "actions")
+                && !row.closest("[data-showskip-owned]")
+                && row.children.length > 1
+                && isRenderedElement(row));
+        if (rows.length > 0) {
+            return rows[rows.length - 1];
+        }
+        const shares = Array.from(documentObject.querySelectorAll('[aria-label="Share"]'))
+            .filter((share) => !share.closest("[data-showskip-owned]")
+                && share.parentElement
+                && share.parentElement.children.length > 1
+                && isRenderedElement(share));
+        return shares.length > 0 ? shares[shares.length - 1].parentElement : null;
+    }
+
     function findNativeButtonTemplate(row) {
         const children = Array.from(row.children).filter((child) => !child.hasAttribute("data-showskip-owned"));
+        // Prefer the round icon-only Share button so ours matches it exactly.
+        const round = children.find((child) => hasModuleClass(child, "round") && child.querySelector("svg"));
+        if (round) {
+            return round;
+        }
         const labelled = children.find((child) => /trailer/iu.test(child.textContent || ""));
         if (labelled) {
             return labelled;
@@ -3694,6 +3728,9 @@
                 flex: 0 0 auto;
                 white-space: nowrap;
             }
+            [data-showskip-launcher="row"] svg {
+                fill: currentColor;
+            }
             [data-showskip-launcher="floating"] {
                 appearance: none;
                 box-sizing: border-box;
@@ -3728,7 +3765,7 @@
                 background: #0d7a86;
                 border-color: rgba(127, 227, 236, 0.6);
             }
-            [data-showskip-launcher]:focus-visible {
+            [data-showskip-launcher="floating"]:focus-visible {
                 outline: 2px solid var(--primary-accent-color, #9c7cff);
                 outline-offset: 3px;
             }
@@ -4050,6 +4087,7 @@
             this.profile = null;
             this.actionRow = null;
             this.launcher = null;
+            this.tooltip = null;
             this.panel = null;
             this.resizeObserver = null;
             this.positionFrame = null;
@@ -4059,9 +4097,11 @@
         }
 
         activate(context, profile, attributionVisible = false) {
-            // The launcher is a floating pill on document.body, so it does not depend on
-            // Stremio's internal action-row markup (which varies between versions).
-            let row = resolveActiveActionRow(this.document) || resolveLooseActionRow(this.document);
+            // Mount a clone of Stremio's own round Share button at the end of the detail
+            // action row. If no row is found, fall back to a floating pill on document.body.
+            let row = resolveActiveActionRow(this.document)
+                || resolveHeroActionRow(this.document)
+                || resolveLooseActionRow(this.document);
             let template = row ? findNativeButtonTemplate(row) : null;
             if (!row || !template) {
                 const byLabel = resolveRowByTrailerLabel(this.document);
@@ -4191,6 +4231,19 @@
                 node.setAttribute("role", "button");
             }
             node.tabIndex = 0;
+            // Native hover tooltips are React-driven and won't fire for a clone; drop the
+            // inert placeholder and show our own copy of Stremio's tooltip instead.
+            for (const placeholder of descendantsWithModuleClass(node, "tooltip-placeholder")) {
+                removeNode(placeholder);
+            }
+            if (this._findTooltipTemplate()) {
+                node.removeAttribute("title");
+            }
+            this._listen(node, "mouseenter", () => this._showNativeTooltip());
+            this._listen(node, "focus", () => this._showNativeTooltip());
+            this._listen(node, "mouseleave", () => this._hideNativeTooltip());
+            this._listen(node, "blur", () => this._hideNativeTooltip());
+            this._listen(node, "click", () => this._hideNativeTooltip());
 
             const nativeSvg = node.querySelector("svg");
             const icon = createSvgIcon(this.document);
@@ -4230,6 +4283,61 @@
                 }
             });
             return node;
+        }
+
+        _findTooltipTemplate() {
+            const items = descendantsWithModuleClass(this.document, "tooltip-item")
+                .filter((item) => !item.hasAttribute("data-showskip-owned") && hasModuleClass(item, "tooltip-container"));
+            return items.length > 0 ? items[0] : null;
+        }
+
+        _showNativeTooltip() {
+            const launcher = this.launcher;
+            if (!launcher || !launcher.isConnected || launcher.getAttribute("data-showskip-launcher") !== "row"
+                || launcher.getAttribute("aria-expanded") === "true") {
+                return;
+            }
+            if (!this.tooltip || !this.tooltip.isConnected) {
+                const template = this._findTooltipTemplate();
+                if (!template || !template.parentNode) {
+                    return;
+                }
+                const tooltip = template.cloneNode(false);
+                tooltip.removeAttribute("style");
+                tooltip.classList.remove("active");
+                tooltip.setAttribute("data-showskip-owned", "tooltip");
+                tooltip.setAttribute("aria-hidden", "true");
+                tooltip.textContent = "ShowSkip settings";
+                template.parentNode.appendChild(tooltip);
+                this.tooltip = tooltip;
+            }
+            // Same placement as Stremio's tooltips: centred above the button, 1rem gap.
+            const rootSize = parseFloat(this.window.getComputedStyle(this.document.documentElement).fontSize) || 16;
+            const rect = launcher.getBoundingClientRect();
+            const tipRect = this.tooltip.getBoundingClientRect();
+            const left = Math.max(4, Math.min(rect.left + (rect.width - tipRect.width) / 2,
+                this.window.innerWidth - tipRect.width - 4));
+            const above = rect.top - tipRect.height - rootSize;
+            const top = above >= 4 ? above : rect.bottom + rootSize;
+            this.tooltip.style.left = `${left}px`;
+            this.tooltip.style.top = `${top}px`;
+            this.tooltip.classList.add("active");
+        }
+
+        _hideNativeTooltip() {
+            if (this.tooltip) {
+                this.tooltip.classList.remove("active");
+            }
+        }
+
+        _removeNativeTooltip() {
+            if (this.tooltip) {
+                removeNode(this.tooltip);
+                this.tooltip = null;
+            }
+            for (const stale of this.document.querySelectorAll('[data-showskip-owned="tooltip"]')) {
+                removeNode(stale);
+            }
         }
 
         _openPanelFromLauncher() {
@@ -4513,6 +4621,7 @@
 
         _removePresentation() {
             this._removePanel(false);
+            this._removeNativeTooltip();
             this._removeAllListeners();
             if (this.launcher) {
                 removeNode(this.launcher);
