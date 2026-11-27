@@ -32,3 +32,23 @@ Desktop.ini
 *.key
 *.pem
 secrets*
+
+# Private / local state (never publish)
+.state/
+logs/
+config.json
+*.local.json
+.claude/
+*.sqlite
+*.sqlite3
+*.db
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.exe
+*.dll
+*.msi
+*.zip
+*.7z
+*.vsix
