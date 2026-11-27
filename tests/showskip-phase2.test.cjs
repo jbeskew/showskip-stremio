@@ -1268,3 +1268,17 @@ test("production v1 enables Phase 3 actions and confines its sole media write to
     assert.match(source, /https:\/\/api\.theintrodb\.org\/v3\/media/u);
     assert.equal(PROVIDER_LIMITS.durationQuietMs, 750);
 });
+
+test("a lone Stremio Plus stand-in mounted outside the player container is still found", () => {
+    const empty = createPlayerDom({ videoCount: 0 });
+    const standIn = { isConnected: true, getBoundingClientRect: () => ({ width: 10, height: 10 }) };
+    const original = empty.documentObject.querySelectorAll.bind(empty.documentObject);
+    empty.documentObject.querySelectorAll = (selector) => (
+        selector === "video[data-splus-video]" ? [standIn] : original(selector)
+    );
+    assert.equal(resolveActiveHtmlVideo(empty.documentObject, empty.windowObject), standIn);
+    empty.documentObject.querySelectorAll = (selector) => (
+        selector === "video[data-splus-video]" ? [standIn, { ...standIn }] : original(selector)
+    );
+    assert.equal(resolveActiveHtmlVideo(empty.documentObject, empty.windowObject), null);
+});

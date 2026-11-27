@@ -93,7 +93,7 @@
         preview: Object.freeze({ minimum: 5_000, maximum: 1_800_000 }),
     });
     const PLAYBACK_ACTION_LIMITS = Object.freeze({
-        seekTimeoutMs: 1_500,
+        seekTimeoutMs: 4_000,
         seekableToleranceMs: 500,
         seekResultToleranceMs: 750,
         minimumForwardSeekMs: 250,
@@ -1688,6 +1688,22 @@
         return true;
     }
 
+    // Stremio Plus (mpv playback) mounts one invisible <video data-splus-video> stand-in
+    // directly under the player container; it mirrors mpv time/duration/seek.
+    function resolveShellVideoStandIn(player, windowObject) {
+        if (!player || typeof player.querySelectorAll !== "function") {
+            return null;
+        }
+        let candidates;
+        try {
+            candidates = Array.from(player.querySelectorAll("video[data-splus-video]"));
+        } catch (_error) {
+            return null;
+        }
+        const visible = candidates.filter((video) => isVisiblyActiveElement(video, windowObject));
+        return visible.length === 1 ? visible[0] : null;
+    }
+
     function resolveActiveHtmlVideo(documentObject, windowObject) {
         const routeRoot = resolveActiveRouteRoot(documentObject);
         if (!routeRoot) {
@@ -1698,14 +1714,25 @@
             return null;
         }
         const videoContainers = descendantsWithModuleClass(players[0], "video-container");
-        if (videoContainers.length !== 1 || !isVisiblyActiveElement(videoContainers[0], windowObject)) {
+        if (videoContainers.length > 1 || (videoContainers.length === 1
+            && !isVisiblyActiveElement(videoContainers[0], windowObject))) {
             return null;
         }
-        const videos = typeof videoContainers[0].querySelectorAll === "function"
+        const videos = videoContainers.length === 1 && typeof videoContainers[0].querySelectorAll === "function"
             ? Array.from(videoContainers[0].querySelectorAll("video"))
                 .filter((video) => isVisiblyActiveElement(video, windowObject))
             : [];
-        return videos.length === 1 ? videos[0] : null;
+        if (videos.length > 1) {
+            return null;
+        }
+        if (videos.length === 1) {
+            return videos[0];
+        }
+        // Stremio Plus can mount its stand-in under <body> when the player route was
+        // already open at page load (the container did not exist yet), so also accept a
+        // single document-level stand-in while exactly one active player container exists.
+        return resolveShellVideoStandIn(players[0], windowObject)
+            || resolveShellVideoStandIn(documentObject, windowObject);
     }
 
     function normalizeDurationMs(durationSeconds) {
@@ -4419,8 +4446,10 @@
                 pointer-events: none;
                 transform: translate(-50%, -100%);
             }
+            [data-showskip-timeline-tooltip],
             [data-showskip-timeline-tooltip][hidden] {
-                display: none;
+                /* The marker hover label is intentionally not shown; markers keep their aria-label. */
+                display: none !important;
             }
             @media screen and (max-width: 640px) {
                 [data-showskip-panel] {
@@ -5366,6 +5395,7 @@
                 providerCacheKey,
                 resolveActiveActionRow,
                 resolveActiveHtmlVideo,
+                resolveShellVideoStandIn,
                 resolveActiveRouteRoot,
                 resolveActiveSeekTarget,
                 segmentAccessibleLabel,

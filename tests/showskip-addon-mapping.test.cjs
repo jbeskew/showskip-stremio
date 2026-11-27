@@ -324,3 +324,16 @@ test("mapping failures report fixed codes without leaking the URL or ids", async
         assert.doesNotMatch(line, /example|insecure|kitsu|7442|http/u);
     }
 });
+
+test("Stremio Plus stand-in video is accepted only when it is the single visible candidate", () => {
+    const { resolveShellVideoStandIn } = loadHooks();
+    const video = (extra = {}) => ({ isConnected: true, getBoundingClientRect: () => ({ width: 10, height: 10 }), ...extra });
+    const windowObject = { getComputedStyle: (el) => ({ display: el.display || "block", visibility: el.visibility || "visible" }) };
+    const player = (videos) => ({ querySelectorAll: (selector) => (selector === "video[data-splus-video]" ? videos : []) });
+    const one = video();
+    assert.equal(resolveShellVideoStandIn(player([one]), windowObject), one);
+    assert.equal(resolveShellVideoStandIn(player([one, video()]), windowObject), null);
+    assert.equal(resolveShellVideoStandIn(player([video({ display: "none" })]), windowObject), null);
+    assert.equal(resolveShellVideoStandIn(player([]), windowObject), null);
+    assert.equal(resolveShellVideoStandIn(null, windowObject), null);
+});
