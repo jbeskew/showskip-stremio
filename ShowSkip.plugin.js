@@ -363,6 +363,18 @@
             : null;
     }
 
+    // Anime-style catalogs (for example Kitsu) use `<metaId>:<episode>` with no season.
+    function parseSingleEpisodeVideoId(metaId, videoId) {
+        if (!isSafeMetaId(metaId) || !isSafeMetaId(videoId) || !videoId.startsWith(`${metaId}:`)) {
+            return null;
+        }
+        const rest = videoId.slice(metaId.length + 1);
+        if (!/^[1-9][0-9]{0,8}$/u.test(rest)) {
+            return null;
+        }
+        return { episode: Number(rest) };
+    }
+
     function parseRoute(hash, limits = LIMITS) {
         if (typeof hash !== "string" || hash.length > 16_384) {
             return { kind: "other" };
@@ -415,8 +427,20 @@
                     signature: JSON.stringify(["player", stableHash(value)]),
                 };
             }
-            const episodeIdentity = parseEpisodeVideoId(metaId, videoId);
+            const fullIdentity = parseEpisodeVideoId(metaId, videoId);
+            const singleIdentity = fullIdentity || /^tt[0-9]{7,}$/iu.test(metaId)
+                ? null
+                : parseSingleEpisodeVideoId(metaId, videoId);
+            const episodeIdentity = fullIdentity || singleIdentity;
             const showKey = canonicalShowKey(metaId, limits);
+            let metaTransportUrl = null;
+            if (encodedParts[3].length > 0) {
+                try {
+                    metaTransportUrl = decodeURIComponent(encodedParts[3]);
+                } catch (_error) {
+                    metaTransportUrl = null;
+                }
+            }
             return {
                 kind: "player",
                 eligible: Boolean(episodeIdentity && showKey),
@@ -424,7 +448,9 @@
                 metaId,
                 videoId,
                 showKey,
-                season: episodeIdentity ? episodeIdentity.season : null,
+                episodeFormat: fullIdentity ? "season-episode" : (singleIdentity ? "single" : null),
+                metaTransportUrl,
+                season: fullIdentity ? fullIdentity.season : null,
                 episode: episodeIdentity ? episodeIdentity.episode : null,
                 signature: JSON.stringify(["player", stableHash(value), type, metaId, videoId]),
             };
@@ -1090,7 +1116,9 @@
         }
         const seriesInfo = ownValue(state, "seriesInfo");
         if (!isPlainObject(seriesInfo)
-            || ownValue(seriesInfo, "season") !== route.season
+            || (route.episodeFormat === "single"
+                ? !isPositiveSafeInteger(ownValue(seriesInfo, "season"))
+                : ownValue(seriesInfo, "season") !== route.season)
             || ownValue(seriesInfo, "episode") !== route.episode) {
             return { kind: "conflict" };
         }
@@ -1130,9 +1158,16 @@
         return { kind: "match" };
     }
 
-    function createEpisodeIdentity(route, coreStates = []) {
+    function isValidAddonMapping(mapping) {
+        return isPlainObject(mapping)
+            && typeof mapping.imdbId === "string" && /^tt[0-9]{7,8}$/u.test(mapping.imdbId)
+            && isPositiveSafeInteger(mapping.season) && isPositiveSafeInteger(mapping.episode);
+    }
+
+    function createEpisodeIdentity(route, coreStates = [], mapping = null, debug = null) {
+        const single = Boolean(route) && route.episodeFormat === "single";
         if (!route || route.kind !== "player" || route.eligible !== true
-            || !isPositiveSafeInteger(route.season) || !isPositiveSafeInteger(route.episode)) {
+            || (!single && !isPositiveSafeInteger(route.season)) || !isPositiveSafeInteger(route.episode)) {
             return null;
         }
         let matchedCore = false;
@@ -1143,23 +1178,52 @@
             conflictingCore = conflictingCore || classification.kind === "conflict";
         }
         if (conflictingCore) {
+            reportDebug(debug, "identity:core-conflict");
             return null;
         }
 
-        const imdbId = /^tt[0-9]{7,8}$/iu.test(route.metaId) ? route.metaId.toLowerCase() : null;
-        const episodeKey = `${route.showKey}|s${route.season}|e${route.episode}|${encodeURIComponent(route.videoId)}`;
+        let imdbId = /^tt[0-9]{7,8}$/iu.test(route.metaId) ? route.metaId.toLowerCase() : null;
+        let providerMediaId = imdbId ? Object.freeze({ scheme: "imdb", value: imdbId }) : null;
+        let tmdbId = null;
+        let season = route.season;
+        let episode = route.episode;
+        let mappingSource = null;
+        if (!imdbId && single) {
+            // A single-number id carries no provider season; only a validated addon
+            // mapping may supply provider identity and season/episode numbering.
+            if (!isValidAddonMapping(mapping)) {
+                reportDebug(debug, "identity:no-provider-id");
+                return null;
+            }
+            imdbId = mapping.imdbId;
+            season = mapping.season;
+            episode = mapping.episode;
+            providerMediaId = Object.freeze({ scheme: "imdb", value: imdbId });
+            mappingSource = "addon-meta";
+        } else if (!imdbId) {
+            const tmdbMatch = /^tmdb:([1-9][0-9]{0,7})$/u.exec(route.metaId);
+            if (tmdbMatch && Number(tmdbMatch[1]) <= 10_000_000) {
+                tmdbId = Number(tmdbMatch[1]);
+                providerMediaId = Object.freeze({ scheme: "tmdb", value: tmdbId });
+            }
+        }
+        if (!providerMediaId) {
+            reportDebug(debug, "identity:no-provider-id");
+        }
+        const episodeKey = `${route.showKey}|s${season}|e${episode}|${encodeURIComponent(route.videoId)}`;
         return Object.freeze({
             showKey: route.showKey,
             canonicalSeriesId: route.metaId,
             stremioSeriesId: route.metaId,
             stremioVideoId: route.videoId,
             episodeKey,
-            season: route.season,
-            episode: route.episode,
+            season,
+            episode,
             imdbId,
-            tmdbId: null,
+            tmdbId,
             tvdbId: null,
-            providerMediaId: imdbId ? Object.freeze({ scheme: "imdb", value: imdbId }) : null,
+            providerMediaId,
+            mappingSource,
             activeRoute: Object.freeze({
                 kind: "player",
                 type: route.type,
@@ -1298,10 +1362,288 @@
         }
     }
 
+    // Opt-in diagnostics. Off unless localStorage "showskip.debug" is "1". Only fixed
+    // reason codes are ever written: never URLs, ids, titles, durations or timestamps.
+    const DEBUG_CODES = Object.freeze(new Set([
+        "route-ineligible:not-series",
+        "route-ineligible:bad-video-id",
+        "identity:core-conflict",
+        "identity:no-provider-id",
+        "mapping:transport-unsupported",
+        "mapping:fetch-failed",
+        "mapping:invalid",
+        "mapping:episode-missing",
+        "provider:no-data",
+        "provider:no-usable-segments",
+        "provider:request-failed",
+        "provider:rate-limited",
+        "provider:daily-limit",
+        "media:unsupported",
+    ]));
+
+    function createDebugReporter(windowObject, options = {}) {
+        const seen = new Set();
+        const sink = options.console || (typeof console === "object" ? console : null);
+        function enabled() {
+            try {
+                return Boolean(windowObject && windowObject.localStorage
+                    && windowObject.localStorage.getItem("showskip.debug") === "1");
+            } catch (_error) {
+                return false;
+            }
+        }
+        function report(scope, code) {
+            if (!DEBUG_CODES.has(code) || !enabled()) {
+                return;
+            }
+            const key = `${scope}|${code}`;
+            if (seen.has(key)) {
+                return;
+            }
+            if (seen.size >= 200) {
+                seen.clear();
+            }
+            seen.add(key);
+            try {
+                if (sink && typeof sink.debug === "function") {
+                    sink.debug(`[ShowSkip] ${code}`);
+                }
+            } catch (_error) {
+                // Diagnostics must never affect plugin behavior.
+            }
+        }
+        return Object.freeze({
+            report,
+            scoped: (scope) => (code) => report(String(scope), code),
+        });
+    }
+
+    function reportDebug(debug, code) {
+        if (typeof debug === "function") {
+            try {
+                debug(code);
+            } catch (_error) {
+                // Diagnostics must never affect plugin behavior.
+            }
+        }
+    }
+
+    const ADDON_META_LIMITS = Object.freeze({
+        maxResponseBytes: 1024 * 1024,
+        timeoutMs: 8_000,
+        cacheEntries: 16,
+        maxVideos: 5_000,
+        failureTtlMs: 30_000,
+    });
+
+    // The meta resource lives next to the addon manifest the player route names.
+    function buildAddonMetaUrl(route) {
+        if (!route || typeof route.metaTransportUrl !== "string" || !isSafeMetaId(route.metaId)) {
+            return null;
+        }
+        let url;
+        try {
+            url = new URL(route.metaTransportUrl);
+        } catch (_error) {
+            return null;
+        }
+        if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash
+            || !url.pathname.endsWith("/manifest.json")) {
+            return null;
+        }
+        const basePath = url.pathname.slice(0, url.pathname.length - "manifest.json".length);
+        return `${url.origin}${basePath}meta/series/${encodeURIComponent(route.metaId)}.json`;
+    }
+
+    // Reduce an addon meta body to videoId -> provider numbering. Anything ambiguous is dropped.
+    function extractAddonMappings(body, metaId) {
+        if (!isPlainObject(body)) {
+            return null;
+        }
+        const meta = ownValue(body, "meta");
+        if (!isPlainObject(meta) || ownValue(meta, "id") !== metaId || ownValue(meta, "type") !== "series") {
+            return null;
+        }
+        const videos = ownValue(meta, "videos");
+        if (!Array.isArray(videos) || videos.length > ADDON_META_LIMITS.maxVideos) {
+            return null;
+        }
+        const metaImdb = ownValue(meta, "imdb_id");
+        const mappings = new Map();
+        const duplicates = new Set();
+        for (const video of videos) {
+            const id = isPlainObject(video) ? ownValue(video, "id") : undefined;
+            if (typeof id !== "string") {
+                continue;
+            }
+            if (mappings.has(id) || duplicates.has(id)) {
+                duplicates.add(id);
+                continue;
+            }
+            const imdbId = ownValue(video, "imdb_id");
+            const season = ownValue(video, "imdbSeason");
+            const episode = ownValue(video, "imdbEpisode");
+            const candidate = { imdbId, season, episode };
+            if (!isValidAddonMapping(candidate)
+                || (metaImdb !== undefined && metaImdb !== null && metaImdb !== imdbId)) {
+                duplicates.add(id);
+                continue;
+            }
+            mappings.set(id, Object.freeze(candidate));
+        }
+        for (const id of duplicates) {
+            mappings.delete(id);
+        }
+        return mappings;
+    }
+
+    class AddonMetaMappingReader {
+        constructor(options = {}) {
+            this.fetch = options.fetch;
+            this.setTimeout = options.setTimeout || setTimeout;
+            this.clearTimeout = options.clearTimeout || clearTimeout;
+            this.AbortController = hasOwn(options, "AbortController")
+                ? options.AbortController
+                : globalThis.AbortController;
+            this.now = options.now || Date.now;
+            this.debug = options.debug || null;
+            this.timeoutMs = options.timeoutMs || ADDON_META_LIMITS.timeoutMs;
+            this.cache = new Map();
+            this.inFlight = new Map();
+            this.controllers = new Set();
+            this.destroyed = false;
+        }
+
+        _report(route, code) {
+            if (this.debug) {
+                this.debug.report(String(route.signature), code);
+            }
+        }
+
+        async resolve(route, signal) {
+            const url = buildAddonMetaUrl(route);
+            if (!url) {
+                this._report(route, "mapping:transport-unsupported");
+                return null;
+            }
+            if (typeof this.fetch !== "function" || typeof this.AbortController !== "function" || this.destroyed) {
+                this._report(route, "mapping:fetch-failed");
+                return null;
+            }
+            if (signal && signal.aborted) {
+                throw abortError();
+            }
+            let entry = this.cache.get(url);
+            if (entry && entry.expiresAt !== null && entry.expiresAt <= this.now()) {
+                this.cache.delete(url);
+                entry = undefined;
+            }
+            if (!entry) {
+                let pending = this.inFlight.get(url);
+                if (!pending) {
+                    pending = this._load(url, route.metaId).finally(() => this.inFlight.delete(url));
+                    this.inFlight.set(url, pending);
+                }
+                entry = await this._withSignal(pending, signal);
+            }
+            if (signal && signal.aborted) {
+                throw abortError();
+            }
+            if (!entry.mappings) {
+                this._report(route, entry.reason);
+                return null;
+            }
+            const mapping = entry.mappings.get(route.videoId);
+            if (!mapping) {
+                this._report(route, "mapping:episode-missing");
+                return null;
+            }
+            return mapping;
+        }
+
+        _withSignal(promise, signal) {
+            if (!signal) {
+                return promise;
+            }
+            return new Promise((resolve, reject) => {
+                const onAbort = () => reject(abortError());
+                signal.addEventListener("abort", onAbort, { once: true });
+                promise.then(
+                    (value) => {
+                        signal.removeEventListener("abort", onAbort);
+                        resolve(value);
+                    },
+                    (error) => {
+                        signal.removeEventListener("abort", onAbort);
+                        reject(error);
+                    },
+                );
+            });
+        }
+
+        async _load(url, metaId) {
+            const failure = (reason, ttl) => ({
+                mappings: null,
+                reason,
+                expiresAt: ttl ? this.now() + ADDON_META_LIMITS.failureTtlMs : null,
+            });
+            const controller = new this.AbortController();
+            this.controllers.add(controller);
+            const timeout = this.setTimeout(() => controller.abort(), this.timeoutMs);
+            let entry;
+            try {
+                const response = await this.fetch(url, {
+                    method: "GET",
+                    headers: { Accept: "application/json" },
+                    credentials: "omit",
+                    cache: "default",
+                    redirect: "error",
+                    referrerPolicy: "no-referrer",
+                    signal: controller.signal,
+                });
+                if (!response || response.status !== 200) {
+                    entry = failure("mapping:fetch-failed", true);
+                } else {
+                    const body = await readBoundedJson(response, ADDON_META_LIMITS.maxResponseBytes);
+                    const mappings = extractAddonMappings(body, metaId);
+                    entry = mappings
+                        ? { mappings, reason: null, expiresAt: null }
+                        : failure("mapping:invalid", false);
+                }
+            } catch (_error) {
+                entry = failure("mapping:fetch-failed", true);
+            } finally {
+                this.clearTimeout(timeout);
+                this.controllers.delete(controller);
+            }
+            if (this.destroyed) {
+                return entry;
+            }
+            this.cache.delete(url);
+            this.cache.set(url, entry);
+            while (this.cache.size > ADDON_META_LIMITS.cacheEntries) {
+                this.cache.delete(this.cache.keys().next().value);
+            }
+            return entry;
+        }
+
+        destroy() {
+            this.destroyed = true;
+            for (const controller of this.controllers) {
+                controller.abort();
+            }
+            this.controllers.clear();
+            this.inFlight.clear();
+            this.cache.clear();
+        }
+    }
+
     class EpisodeIdentityProvider {
-        constructor(contextDetector, coreStateReader) {
+        constructor(contextDetector, coreStateReader, mappingReader = null, debug = null) {
             this.contextDetector = contextDetector;
             this.coreStateReader = coreStateReader;
+            this.mappingReader = mappingReader;
+            this.debug = debug;
         }
 
         async resolve(route, signal) {
@@ -1312,11 +1654,18 @@
             if (signal && signal.aborted) {
                 throw abortError();
             }
+            let mapping = null;
+            if (route.episodeFormat === "single" && this.mappingReader) {
+                mapping = await this.mappingReader.resolve(route, signal);
+                if (signal && signal.aborted) {
+                    throw abortError();
+                }
+            }
             const current = this.contextDetector.current();
             if (current.kind !== "player" || current.signature !== route.signature) {
                 return null;
             }
-            return createEpisodeIdentity(route, states);
+            return createEpisodeIdentity(route, states, mapping, this.debug ? this.debug.scoped(route.signature) : null);
         }
     }
 
@@ -2508,6 +2857,62 @@
         });
     }
 
+    async function readBoundedJson(response, maxBytes) {
+        const declared = responseHeader(response, "Content-Length");
+        if (typeof declared === "string" && /^[0-9]+$/u.test(declared.trim())
+            && Number(declared.trim()) > maxBytes) {
+            throw new Error("Provider response is too large");
+        }
+
+        let body;
+        if (response.body && typeof response.body.getReader === "function") {
+            const reader = response.body.getReader();
+            const chunks = [];
+            let total = 0;
+            try {
+                while (true) {
+                    const part = await reader.read();
+                    if (part.done) {
+                        break;
+                    }
+                    if (!(part.value instanceof Uint8Array)) {
+                        throw new Error("Malformed provider body stream");
+                    }
+                    total += part.value.byteLength;
+                    if (total > maxBytes) {
+                        await reader.cancel();
+                        throw new Error("Provider response is too large");
+                    }
+                    chunks.push(part.value);
+                }
+            } finally {
+                if (typeof reader.releaseLock === "function") {
+                    reader.releaseLock();
+                }
+            }
+            const bytes = new Uint8Array(total);
+            let offset = 0;
+            for (const chunk of chunks) {
+                bytes.set(chunk, offset);
+                offset += chunk.byteLength;
+            }
+            body = JSON.parse(new TextDecoder().decode(bytes));
+        } else if (typeof response.text === "function") {
+            const text = await response.text();
+            const bytes = typeof TextEncoder === "function" ? new TextEncoder().encode(text).byteLength : text.length * 2;
+            if (bytes > maxBytes) {
+                throw new Error("Provider response is too large");
+            }
+            body = JSON.parse(text);
+        } else {
+            body = await response.json();
+        }
+        if (serializedByteLength(body) > maxBytes) {
+            throw new Error("Provider response is too large");
+        }
+        return body;
+    }
+
     class TheIntroDBProvider {
         constructor(options = {}) {
             this.fetch = options.fetch;
@@ -2733,60 +3138,8 @@
             return { kind: "cacheable", result: Object.freeze({ kind: "segments", bundle }) };
         }
 
-        async _readJson(response) {
-            const declared = responseHeader(response, "Content-Length");
-            if (typeof declared === "string" && /^[0-9]+$/u.test(declared.trim())
-                && Number(declared.trim()) > PROVIDER_LIMITS.maxResponseBytes) {
-                throw new Error("Provider response is too large");
-            }
-
-            let body;
-            if (response.body && typeof response.body.getReader === "function") {
-                const reader = response.body.getReader();
-                const chunks = [];
-                let total = 0;
-                try {
-                    while (true) {
-                        const part = await reader.read();
-                        if (part.done) {
-                            break;
-                        }
-                        if (!(part.value instanceof Uint8Array)) {
-                            throw new Error("Malformed provider body stream");
-                        }
-                        total += part.value.byteLength;
-                        if (total > PROVIDER_LIMITS.maxResponseBytes) {
-                            await reader.cancel();
-                            throw new Error("Provider response is too large");
-                        }
-                        chunks.push(part.value);
-                    }
-                } finally {
-                    if (typeof reader.releaseLock === "function") {
-                        reader.releaseLock();
-                    }
-                }
-                const bytes = new Uint8Array(total);
-                let offset = 0;
-                for (const chunk of chunks) {
-                    bytes.set(chunk, offset);
-                    offset += chunk.byteLength;
-                }
-                body = JSON.parse(new TextDecoder().decode(bytes));
-            } else if (typeof response.text === "function") {
-                const text = await response.text();
-                const bytes = typeof TextEncoder === "function" ? new TextEncoder().encode(text).byteLength : text.length * 2;
-                if (bytes > PROVIDER_LIMITS.maxResponseBytes) {
-                    throw new Error("Provider response is too large");
-                }
-                body = JSON.parse(text);
-            } else {
-                body = await response.json();
-            }
-            if (serializedByteLength(body) > PROVIDER_LIMITS.maxResponseBytes) {
-                throw new Error("Provider response is too large");
-            }
-            return body;
+        _readJson(response) {
+            return readBoundedJson(response, PROVIDER_LIMITS.maxResponseBytes);
         }
     }
 
@@ -3103,6 +3456,7 @@
             this.provider = options.provider;
             this.onSchedule = options.onSchedule;
             this.onProviderUsed = options.onProviderUsed;
+            this.debug = options.debug || null;
             this.timeline = options.timeline || new TimelineRenderer(this.document);
             this.AbortController = options.AbortController || this.window.AbortController || globalThis.AbortController;
             this.actionsEnabled = options.actionsEnabled === true;
@@ -3220,6 +3574,7 @@
 
             const video = resolveActiveHtmlVideo(this.document, this.window);
             if (!video) {
+                this._debug("media:unsupported");
                 this._detachMedia();
                 return false;
             }
@@ -3345,6 +3700,28 @@
             return `${this.episodeToken}|${this.mediaToken}|${this.source.length}:${stableHash(this.source)}`;
         }
 
+        _debug(code) {
+            if (this.debug && this.route) {
+                this.debug.report(String(this.route.signature), code);
+            }
+        }
+
+        _debugProviderResult(result) {
+            if (!result || result.kind === "segments") {
+                return;
+            }
+            if (result.kind === "empty") {
+                this._debug(result.reason === "no-valid-segments" ? "provider:no-usable-segments" : "provider:no-data");
+                return;
+            }
+            const byReason = {
+                "daily-limit": "provider:daily-limit",
+                "rate-limit": "provider:rate-limited",
+                unsupported: "identity:no-provider-id",
+            };
+            this._debug(byReason[result.reason] || "provider:request-failed");
+        }
+
         _lookup(scopeKey, durationMs) {
             if (this.destroyed || !this.identity || !this.adapter || scopeKey !== this._scopeKey()) {
                 return;
@@ -3372,6 +3749,7 @@
                         || scopeKey !== this._scopeKey() || !this._liveSnapshot(durationMs)) {
                         return;
                     }
+                    this._debugProviderResult(result);
                     if (result.kind === "segments") {
                         this.bundlesByDuration.set(durationMs, result.bundle);
                         this.currentBundle = result.bundle;
@@ -3386,6 +3764,7 @@
                 })
                 .catch((error) => {
                     if (!error || error.name !== "AbortError") {
+                        this._debug("provider:request-failed");
                         this._resetActions();
                         this.timeline.clear();
                     }
@@ -4678,7 +5057,20 @@
             this.store = new ProfileStore(api, this.logger);
             this.contextDetector = new ContextDetector(windowObject);
             this.coreStateReader = new CoreStateReader(windowObject);
-            this.episodeIdentityProvider = new EpisodeIdentityProvider(this.contextDetector, this.coreStateReader);
+            this.debug = createDebugReporter(windowObject);
+            this.addonMetaReader = new AddonMetaMappingReader({
+                fetch: typeof windowObject.fetch === "function" ? windowObject.fetch.bind(windowObject) : null,
+                setTimeout: windowObject.setTimeout.bind(windowObject),
+                clearTimeout: windowObject.clearTimeout.bind(windowObject),
+                AbortController: windowObject.AbortController,
+                debug: this.debug,
+            });
+            this.episodeIdentityProvider = new EpisodeIdentityProvider(
+                this.contextDetector,
+                this.coreStateReader,
+                this.addonMetaReader,
+                this.debug,
+            );
             this.providerUsedShows = new Set();
             this.segmentProvider = new TheIntroDBProvider({
                 fetch: typeof windowObject.fetch === "function" ? windowObject.fetch.bind(windowObject) : null,
@@ -4699,6 +5091,7 @@
                 provider: this.segmentProvider,
                 onSchedule: () => this.scheduleReconcile(),
                 onProviderUsed: (showKey) => this.providerUsedShows.add(showKey),
+                debug: this.debug,
                 AbortController: windowObject.AbortController,
                 actionsEnabled: PHASE3_PLAYBACK_ACTIONS_ENABLED,
                 getProfile: (showKey) => this.store.getOrCreateProfile(showKey),
@@ -4788,6 +5181,7 @@
             this.listeners = [];
             this.showPage.destroy();
             this.player.destroy();
+            this.addonMetaReader.destroy();
             for (const node of this.document.querySelectorAll(OWNED_SELECTOR)) {
                 removeNode(node);
             }
@@ -4808,6 +5202,12 @@
             const controllerRevision = this.showPage.mutationRevision;
             if (context.kind === "player") {
                 this.showPage.deactivate();
+                if (context.eligible !== true) {
+                    this.debug.report(
+                        String(context.signature),
+                        context.type === "series" ? "route-ineligible:bad-video-id" : "route-ineligible:not-series",
+                    );
+                }
                 const active = await this.player.reconcile(context);
                 if (this.destroyed || generation !== this.generation) {
                     return;
@@ -4933,6 +5333,7 @@
                 CoalescedScheduler,
                 CoreStateReader,
                 DurationStabilizer,
+                AddonMetaMappingReader,
                 EpisodeIdentityProvider,
                 HtmlMediaAdapter,
                 NextEpisodeAdapter,
@@ -4943,12 +5344,15 @@
                 ShowPageController,
                 TheIntroDBProvider,
                 TimelineRenderer,
+                buildAddonMetaUrl,
                 buildTheIntroDbUrl,
                 canonicalShowKey,
                 classifyCorePlayerState,
                 computeMarkerGeometry,
+                createDebugReporter,
                 createEpisodeIdentity,
                 createDefaultProfile,
+                extractAddonMappings,
                 createStyles,
                 ensureSingleOwnedNode,
                 formatTimelineTime,
@@ -4958,6 +5362,7 @@
                 normalizeState,
                 parseRoute,
                 parseEpisodeVideoId,
+                parseSingleEpisodeVideoId,
                 providerCacheKey,
                 resolveActiveActionRow,
                 resolveActiveHtmlVideo,

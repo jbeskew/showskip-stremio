@@ -121,11 +121,15 @@ The suite covers per-show UI and persistence, strict panel collapse, route and i
 
 ## Provider and privacy
 
-Timestamp data comes from [TheIntroDB](https://theintrodb.org). ShowSkip sends only direct anonymous client-side GET requests to `https://api.theintrodb.org/v3/media`; it sends no API key or ShowSkip account data. Valid positive and explicit no-data responses use a small exact-duration-aware in-memory session cache. Response bodies and timestamps are never written to `state_v1`, files, logs, or a persistent database.
+Timestamp data comes from [TheIntroDB](https://theintrodb.org). ShowSkip sends only direct anonymous client-side GET requests to `https://api.theintrodb.org/v3/media`; it sends no API key or ShowSkip account data. For anime-style catalogs that number episodes without a season (for example Kitsu), it also makes one anonymous, credential-free HTTPS GET per show per session to the metadata addon you already use, only to read that addon's IMDb season/episode mapping; nothing from it is stored. Valid positive and explicit no-data responses use a small exact-duration-aware in-memory session cache. Response bodies and timestamps are never written to `state_v1`, files, logs, or a persistent database.
 
 TheIntroDB's [API reference](https://theintrodb.org/docs), [OpenAPI specification](https://theintrodb.org/openapi.yaml), and [terms](https://theintrodb.org/docs/terms) were reviewed on 2026-08-20. The reviewed terms limit timestamp use to direct client-side non-commercial end-user applications unless separately agreed, permit temporary session caching, and prohibit database reconstruction, persistence, mirroring, or redistribution. After TheIntroDB data actually renders for a show, ShowSkip provides voluntary in-panel attribution for that session.
 
 ShowSkip contains no telemetry, analytics, API-key collection, remote executable code, or remote assets. `@updateUrl none` keeps remote self-updates disabled.
+
+## Troubleshooting missing markers
+
+Markers need TheIntroDB data for the exact episode, so some shows (anime in particular) legitimately have none. To see why a context was skipped, run `localStorage.setItem("showskip.debug", "1")` in the app console (if your Stremio Enhanced build exposes one) and reload; ShowSkip then logs short reason codes such as `identity:no-provider-id`, `mapping:episode-missing`, or `provider:no-data`. The log never contains URLs, IDs, or titles and is off by default. Remove the key with `localStorage.removeItem("showskip.debug")`.
 
 ## Known limitation
 
