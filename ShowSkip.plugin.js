@@ -969,6 +969,27 @@
         return actionRows.length === 1 ? actionRows[0] : null;
     }
 
+    function resolveLooseActionRow(documentObject) {
+        if (!documentObject || typeof documentObject.querySelectorAll !== "function") {
+            return null;
+        }
+        const rows = Array.from(documentObject.querySelectorAll('[class*="action-buttons-container"]'))
+            .filter((row) => hasModuleClass(row, "action-buttons-container")
+                && row.isConnected !== false
+                && !row.closest("[data-showskip-owned]")
+                && row.children.length > 1);
+        return rows.length > 0 ? rows[rows.length - 1] : null;
+    }
+
+    function findNativeButtonTemplate(row) {
+        const children = Array.from(row.children).filter((child) => !child.hasAttribute("data-showskip-owned"));
+        const labelled = children.find((child) => /trailer/iu.test(child.textContent || ""));
+        if (labelled) {
+            return labelled;
+        }
+        return children.length > 0 ? children[children.length - 1] : null;
+    }
+
     function resolveActiveRouteRoot(documentObject) {
         if (!documentObject || typeof documentObject.querySelectorAll !== "function") {
             return null;
@@ -3645,7 +3666,12 @@
         const style = documentObject.createElement("style");
         style.setAttribute("data-showskip-owned", "style");
         style.textContent = `
-            [data-showskip-launcher] {
+            [data-showskip-launcher="row"] {
+                cursor: pointer;
+                flex: 0 0 auto;
+                white-space: nowrap;
+            }
+            [data-showskip-launcher="floating"] {
                 appearance: none;
                 box-sizing: border-box;
                 position: fixed;
@@ -3674,8 +3700,8 @@
                 transition: background-color 140ms ease, border-color 140ms ease;
                 backdrop-filter: blur(12px);
             }
-            [data-showskip-launcher]:hover,
-            [data-showskip-launcher][aria-expanded="true"] {
+            [data-showskip-launcher="floating"]:hover,
+            [data-showskip-launcher="floating"][aria-expanded="true"] {
                 background: #0d7a86;
                 border-color: rgba(127, 227, 236, 0.6);
             }
@@ -3691,7 +3717,7 @@
                 outline: 2px solid var(--showskip-focus-ring);
                 outline-offset: 3px;
             }
-            [data-showskip-launcher] svg {
+            [data-showskip-launcher="floating"] svg {
                 width: 1.3rem;
                 height: 1.3rem;
                 flex: 0 0 auto;
@@ -4012,7 +4038,10 @@
         activate(context, profile, attributionVisible = false) {
             // The launcher is a floating pill on document.body, so it does not depend on
             // Stremio's internal action-row markup (which varies between versions).
-            const host = this.document.body;
+            const row = resolveActiveActionRow(this.document) || resolveLooseActionRow(this.document);
+            const template = row ? findNativeButtonTemplate(row) : null;
+            const mode = row && template ? "row" : "floating";
+            const host = mode === "row" ? row : this.document.body;
             if (!host) {
                 this._removePresentation();
                 this.context = context;
@@ -4023,7 +4052,8 @@
             const contextChanged = !this.context || this.context.showKey !== context.showKey;
             const launcherInvalid = !this.launcher
                 || !this.launcher.isConnected
-                || this.launcher.parentNode !== host;
+                || this.launcher.parentNode !== host
+                || this.launcher.getAttribute("data-showskip-launcher") !== mode;
             if (contextChanged && this.context) {
                 this.mutationRevision += 1;
             }
@@ -4034,17 +4064,20 @@
             this.context = context;
             this.profile = profile;
             this.attributionVisible = attributionVisible === true;
-            this.actionRow = null;
+            this.actionRow = mode === "row" ? row : null;
 
             let created = false;
             if (!this.launcher || !this.launcher.isConnected || this.launcher.parentNode !== host) {
                 for (const stale of this.document.querySelectorAll(LAUNCHER_SELECTOR)) {
                     removeNode(stale);
                 }
-                this.launcher = this._createLauncher();
+                this.launcher = mode === "row" ? this._createNativeLauncher(template) : this._createLauncher();
                 host.appendChild(this.launcher);
                 created = true;
             } else {
+                if (mode === "row" && host.lastElementChild !== this.launcher) {
+                    host.appendChild(this.launcher);
+                }
                 for (const stale of this.document.querySelectorAll(LAUNCHER_SELECTOR)) {
                     if (stale !== this.launcher) {
                         removeNode(stale);
@@ -4099,7 +4132,7 @@
             const button = this.document.createElement("button");
             button.type = "button";
             button.setAttribute("data-showskip-owned", "launcher");
-            button.setAttribute("data-showskip-launcher", "");
+            button.setAttribute("data-showskip-launcher", "floating");
             button.setAttribute("aria-label", "ShowSkip settings for this series");
             button.setAttribute("title", "ShowSkip settings");
             button.setAttribute("aria-expanded", "false");
@@ -4109,6 +4142,66 @@
             label.textContent = "ShowSkip settings";
             button.appendChild(label);
             return button;
+        }
+
+        _createNativeLauncher(template) {
+            const node = template.cloneNode(true);
+            node.removeAttribute("id");
+            node.removeAttribute("href");
+            node.removeAttribute("title");
+            for (const attribute of Array.from(node.attributes)) {
+                if (attribute.name.startsWith("data-") || attribute.name.startsWith("aria-")) {
+                    node.removeAttribute(attribute.name);
+                }
+            }
+            node.setAttribute("data-showskip-owned", "launcher");
+            node.setAttribute("data-showskip-launcher", "row");
+            node.setAttribute("aria-label", "ShowSkip settings for this series");
+            node.setAttribute("title", "ShowSkip settings");
+            node.setAttribute("aria-expanded", "false");
+            if (node.tagName !== "BUTTON") {
+                node.setAttribute("role", "button");
+            }
+            node.tabIndex = 0;
+
+            const nativeSvg = node.querySelector("svg");
+            const icon = createSvgIcon(this.document);
+            if (nativeSvg) {
+                const nativeClass = nativeSvg.getAttribute("class");
+                if (nativeClass) {
+                    icon.setAttribute("class", nativeClass);
+                }
+                nativeSvg.replaceWith(icon);
+            } else {
+                node.insertBefore(icon, node.firstChild);
+            }
+
+            // Replace the template's visible label text, if it has one.
+            const walker = this.document.createTreeWalker(node, 4);
+            let textNode = walker.nextNode();
+            let relabelled = false;
+            while (textNode) {
+                if (!relabelled && textNode.nodeValue && textNode.nodeValue.trim().length > 0) {
+                    textNode.nodeValue = "ShowSkip settings";
+                    relabelled = true;
+                } else if (relabelled && textNode.nodeValue && textNode.nodeValue.trim().length > 0) {
+                    textNode.nodeValue = "";
+                }
+                textNode = walker.nextNode();
+            }
+            if (!relabelled) {
+                const label = this.document.createElement("span");
+                label.textContent = "ShowSkip settings";
+                node.appendChild(label);
+            }
+
+            this._listen(node, "keydown", (event) => {
+                if (node.tagName !== "BUTTON" && (event.key === "Enter" || event.key === " ")) {
+                    event.preventDefault();
+                    this._openPanelFromLauncher();
+                }
+            });
+            return node;
         }
 
         _openPanelFromLauncher() {
