@@ -27,3 +27,8 @@ tmp/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Secrets and keys
+*.key
+*.pem
+secrets*

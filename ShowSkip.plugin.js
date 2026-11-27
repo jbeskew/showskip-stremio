@@ -56,18 +56,18 @@
     ]);
 
     const PANEL_PALETTE = Object.freeze({
-        surface: "#211e2c",
-        primaryText: "#f8f7fb",
-        secondaryText: "#dedbe8",
-        optionText: "#f2eff8",
+        surface: "#12161d",
+        primaryText: "#f4f6f8",
+        secondaryText: "#c3cad4",
+        optionText: "#e6eaef",
         selectedText: "#ffffff",
-        selectedSurface: "#6745c7",
-        disabledText: "#bcb7c8",
-        disabledSelectedSurface: "#493c63",
-        controlSurface: "#302c3e",
-        controlHover: "#3b364a",
-        selectedHover: "#7655d6",
-        focusRing: "#b79cff",
+        selectedSurface: "#0d7a86",
+        disabledText: "#aab2bd",
+        disabledSelectedSurface: "#2a3b42",
+        controlSurface: "#1d232d",
+        controlHover: "#28303d",
+        selectedHover: "#0a6670",
+        focusRing: "#7fe3ec",
     });
 
     const OWNED_SELECTOR = "[data-showskip-owned]";
@@ -3649,8 +3649,8 @@
                 flex: 0 0 auto;
                 margin: 0 0 1rem;
                 padding: 0;
-                border: 1px solid rgba(255, 255, 255, 0.16);
-                border-radius: 50%;
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 1.1rem;
                 color: var(--primary-foreground-color, rgba(255, 255, 255, 0.92));
                 background: var(--overlay-color, rgba(28, 28, 36, 0.66));
                 box-shadow: 0 0.4rem 1.2rem rgba(0, 0, 0, 0.16);
@@ -3660,8 +3660,8 @@
                 backdrop-filter: blur(10px);
             }
             [data-showskip-launcher]:hover {
-                background: var(--primary-accent-color, rgba(123, 91, 245, 0.86));
-                border-color: rgba(255, 255, 255, 0.28);
+                background: #0d7a86;
+                border-color: rgba(127, 227, 236, 0.6);
                 transform: translateY(-1px);
             }
             [data-showskip-launcher]:focus-visible {
@@ -3703,9 +3703,10 @@
                 padding: 1rem;
                 color: var(--showskip-primary-text);
                 background: var(--showskip-surface);
-                border: 1px solid rgba(255, 255, 255, 0.14);
-                border-radius: 1rem;
-                box-shadow: 0 1rem 3rem rgba(0, 0, 0, 0.42);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-top: 3px solid #f3ce55;
+                border-radius: 1.1rem;
+                box-shadow: 0 1.2rem 3.2rem rgba(0, 0, 0, 0.55);
                 font: inherit;
                 backdrop-filter: blur(18px);
                 color-scheme: dark;
@@ -3720,9 +3721,10 @@
             [data-showskip-panel] .showskip-title {
                 margin: 0;
                 color: var(--showskip-primary-text);
-                font-size: 1.05rem;
-                font-weight: 650;
+                font-size: 1.12rem;
+                font-weight: 700;
                 line-height: 1.25;
+                letter-spacing: -0.01em;
             }
             [data-showskip-panel] .showskip-subtitle {
                 margin: 0.18rem 0 0;
@@ -3776,7 +3778,7 @@
                 grid-auto-columns: minmax(0, 1fr);
                 gap: 0.22rem;
                 padding: 0.22rem;
-                border-radius: 0.72rem;
+                border-radius: 0.8rem;
                 background: var(--showskip-control-surface);
                 box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
             }
@@ -3803,7 +3805,7 @@
                 line-height: 1.15;
                 cursor: pointer;
                 user-select: none;
-                transition: color 120ms ease, background-color 120ms ease;
+                transition: color 140ms ease, background-color 140ms ease, box-shadow 140ms ease;
             }
             [data-showskip-panel] .showskip-choice-input:not(:checked):not(:disabled) + .showskip-choice-label:hover {
                 background: var(--showskip-control-hover);
@@ -3858,8 +3860,8 @@
                 border: 1px solid rgba(255, 255, 255, 0.24);
                 border-radius: 0.62rem;
                 color: #ffffff;
-                background: rgba(29, 25, 39, 0.9);
-                box-shadow: 0 0.42rem 1.2rem rgba(0, 0, 0, 0.34);
+                background: rgba(18, 22, 29, 0.92);
+                box-shadow: 0 0.42rem 1.2rem rgba(0, 0, 0, 0.4);
                 cursor: pointer;
                 font: inherit;
                 font-size: 0.86rem;
@@ -3869,7 +3871,7 @@
                 backdrop-filter: blur(12px);
             }
             [data-showskip-playback-action]:hover {
-                background: rgba(103, 69, 199, 0.96);
+                background: #0d7a86;
             }
             [data-showskip-playback-action]:focus-visible {
                 outline: 2px solid #ffffff;
@@ -3928,7 +3930,7 @@
                 border: 1px solid rgba(255, 255, 255, 0.12);
                 border-radius: 0.38rem;
                 color: #f8f7fb;
-                background: rgba(24, 21, 33, 0.96);
+                background: rgba(18, 22, 29, 0.96);
                 box-shadow: 0 0.32rem 0.9rem rgba(0, 0, 0, 0.38);
                 font-size: 0.72rem;
                 line-height: 1.25;
