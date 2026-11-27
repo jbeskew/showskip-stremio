@@ -4,6 +4,35 @@ ShowSkip is a finished local Stremio Enhanced plugin for Windows. Version `1.0.0
 
 This is an Enhanced UI/player plugin, not a normal Stremio addon. It does not modify Stremio Enhanced, Stremio Web, normal Stremio, Stremio Service, or `server.js`.
 
+## Quick install (Windows)
+
+You need Stremio Enhanced installed and opened at least once. ShowSkip needs no API key, account, or login: it only reads public timestamps from TheIntroDB.
+
+1. Download this repo (green **Code** button, then **Download ZIP**, or use `git clone`).
+2. Open PowerShell in the folder and run:
+
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-local.ps1
+   ```
+
+   Or copy `ShowSkip.plugin.js` by hand into `%APPDATA%\stremio-enhanced\plugins\`.
+3. In Stremio Enhanced press `Ctrl+R`, open **Settings → Enhanced → Plugins**, and enable **ShowSkip**.
+4. Open any series. Click the ShowSkip button on the show page to choose **Auto**, **Button**, or **Off** for Recap, Intro, Credits, and Preview.
+
+### Install with Claude Code
+
+Paste this into Claude Code:
+
+> Clone this repo, run `scripts/install-local.ps1`, then run `node --test tests/*.test.cjs` and tell me whether it passed. Afterwards remind me to press Ctrl+R in Stremio Enhanced and enable ShowSkip under Settings → Enhanced → Plugins.
+
+### Update or remove
+
+To update, pull or re-download the repo and run the install script again. To remove it, run `scripts\uninstall-local.ps1` (add `-RemoveSettings` to also delete saved preferences).
+
+### Keep your keys out of the repo
+
+There are no secrets in this repo and none are needed. Never commit debrid or API keys (TorBox and so on), `.env` files, or the generated `ShowSkip.plugin.json` settings file. `.gitignore` already blocks them.
+
 ## Features
 
 - One ShowSkip launcher on supported series detail pages.
