@@ -43,7 +43,7 @@ There are no secrets in this repo and none are needed. Never commit debrid or AP
 - Manual-seek and resume-inside-segment suppression, overlap arbitration, backward rearming, stale-context rejection, bounded seeking, and complete owned cleanup.
 - Direct anonymous TheIntroDB requests with strict response validation, exact-duration session caching, bounded retry/timeout behavior, and no persisted provider data.
 
-ShowSkip does not provide next-episode transitions. No safe stable plugin-scoped Enhanced transition API was verified, so next-episode behavior remains entirely native to Stremio. The settings panel intentionally omits a next-episode row. Existing `nextEpisode` values in `state_v1` remain safely preserved for storage compatibility but have no production transition driver.
+**Outro Next Episode button.** When a show's Credits / Outro is set to `Button` and Stremio reports a next episode, a `Next Episode` button appears directly above `Skip Credits` while the outro plays (never during recap, intro, or preview, and not with Credits set to `Auto`/`Off`). It starts the next episode on the same stream source: ShowSkip asks the same addon that served the current stream for the next episode's streams and picks the first one with the same `bingeGroup` (the rule Stremio itself uses for binge-watching). If no stream can be matched with confidence (no `bingeGroup`, no match, addon error), it opens that episode's stream list instead of guessing. Native Stremio autoplay and the Next popup are untouched. Existing `nextEpisode` values in `state_v1` are preserved but remain inert.
 
 ## Segment modes
 

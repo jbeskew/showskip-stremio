@@ -1,6 +1,6 @@
 # ShowSkip Architecture
 
-Status: ShowSkip 1.0.0 finalized as a local production plugin; segment playback actions enabled; next-episode behavior delegated to Stremio
+Status: ShowSkip 1.0.0 finalized as a local production plugin; segment playback actions enabled; outro-only Next Episode button added (Credits = Button) via `NextEpisodeDriver`; native autoplay/next behavior otherwise delegated to Stremio
 Research dates: provider/seek baseline 2026-08-20; next-action sources 2026-08-29; public trailer DOM recheck 2026-09-05
 Target: Stremio Enhanced for Windows
 Artifact: one self-contained `ShowSkip.plugin.js`
@@ -631,9 +631,16 @@ All tolerances are centralized in `PLAYBACK_ACTION_LIMITS` and covered by depend
 
 ### 6.8 Next-episode boundary
 
-The final v1 settings panel does not expose next-episode choices. Existing profiles may contain any previously valid `nextEpisode` value; normalization and persistence retain it without destructive migration, but production constructs `NextEpisodeAdapter` without an availability reader or transition function. Its capabilities therefore remain false even though segment playback actions are enabled.
+ShowSkip's only next-episode feature is the **outro Next Episode button**: with Credits / Outro set to `Button`, a `Next Episode` button stacks above `Skip Credits` while the playhead is inside a credits region and core reports a next episode. It never appears for recap/intro/preview and never for Credits `Auto`/`Off`. There is no settings row and no `state_v1` change; legacy `nextEpisode` values stay stored but are forced inert in the controller whenever the production driver is present.
 
-ShowSkip does not dispatch raw `Player/NextVideo`, construct or guess deep links/routes, increment episode numbers, click title/text-selected controls, synthesize `Shift+N` or other keyboard events, or inspect React internals. Native autoplay and next-episode behavior remain untouched. Controlled tests retain the injectable adapter semantics as a safety boundary, but no production ShowSkip next action is available or advertised.
+`NextEpisodeDriver` supplies the production `NextEpisodeAdapter` capabilities and is the only code that may dispatch core `Player/NextVideo`, read `deepLinks`, or call `location.replace` (enforced by a source-invariant test):
+
+1. **Availability** is read from core `player.nextVideo` (same authoritative field as the native button), cached from `CoreStateReader` every ~2 s so the adapter's synchronous availability read stays valid. The cache is keyed by route signature.
+2. **Stream choice** (`NextStreamResolver`) fetches `<current stream addon>/stream/series/<nextVideo.id>.json` with the same hardening as the meta mapping reader (https only, no credentials/query, `credentials: "omit"`, `redirect: "error"`, 8 s timeout, 2 MiB cap, abortable). It decodes the current stream from the route (`decodeRouteStream`), and picks the first returned directly playable stream whose `behaviorHints.bingeGroup` equals the current stream's, the same rule as core's `Stream::is_binge_match`. URLs are never logged (debug reports fixed codes only).
+3. **Transition**: dispatch `Player/NextVideo` (best-effort library bookkeeping, as native does), then `location.replace` to `#/player/<encodeRouteStream(stream)>/<stream transport>/<meta transport>/series/<id>/<next id>`, reusing the current route's own encoded transport segments. `encodeRouteStream` mirrors core `Stream::encode` (JSON, zlib stored blocks, base64, URI-encode).
+4. **Fallback**: when no stream is proven (no `bingeGroup`, no match, fetch/parse error, unsupported transport) it navigates to the next episode's stream list (`nextVideo.deepLinks.metaDetailsStreams`, or the equivalent `#/detail/series/<id>/<next id>`). It never plays an unproven stream.
+
+Still not done by ShowSkip: guessing episode numbers, clicking native DOM controls, synthesizing `Shift+N`/keyboard events, inspecting React internals, or interfering with native autoplay and the native Next popup.
 
 ### 6.9 Final v1 capability decision
 

@@ -12,7 +12,10 @@ function loadHooks() {
         AbortController,
         TextDecoder,
         TextEncoder,
+        URL,
         Uint8Array,
+        atob,
+        btoa,
         clearTimeout,
         console,
         setTimeout,
@@ -786,11 +789,314 @@ test("session replacement and teardown clear fired, pending, seeking, and next s
 test("source has exactly one playback write, no guessed navigation, and gate is not stored or remotely controlled", () => {
     const source = fs.readFileSync(path.join(__dirname, "..", "ShowSkip.plugin.js"), "utf8");
     assert.equal([...source.matchAll(/\.currentTime\s*=/gu)].length, 1);
-    assert.doesNotMatch(source, /Player\s*\/\s*NextVideo|Shift\+N|KeyboardEvent|deepLinks|location\.hash\s*=/u);
+    assert.doesNotMatch(source, /Shift\+N|KeyboardEvent|location\.hash\s*=/u);
+    // The only sanctioned next-episode mechanism: core NextVideo + deep links live in NextEpisodeDriver.
+    const driverStart = source.indexOf("class NextEpisodeDriver {");
+    const driverEnd = source.indexOf("class EpisodeIdentityProvider {", driverStart);
+    assert.ok(driverStart > 0 && driverEnd > driverStart);
+    const outsideDriver = source.slice(0, driverStart) + source.slice(driverEnd);
+    assert.doesNotMatch(outsideDriver, /action:\s*"NextVideo"|deepLinks|location\.replace/u);
     assert.match(source, /const PHASE3_PLAYBACK_ACTIONS_ENABLED = true;/u);
     assert.doesNotMatch(source, /PHASE3_PLAYBACK_ACTIONS_ENABLED\s*[:=].*(?:getSetting|fetch|localStorage|process\.env)/u);
     const wiringStart = source.indexOf("this.nextAdapter = options.nextAdapter || new NextEpisodeAdapter({");
     const wiringEnd = source.indexOf("this.route = null;", wiringStart);
     assert.ok(wiringStart > 0 && wiringEnd > wiringStart);
-    assert.doesNotMatch(source.slice(wiringStart, wiringEnd), /readAvailability|transition/u);
+    // Capabilities may only come from the injected driver, never from inline logic.
+    assert.match(source.slice(wiringStart, wiringEnd), /readAvailability: this\.nextDriver \?/u);
+    assert.match(source.slice(wiringStart, wiringEnd), /transition: this\.nextDriver \?/u);
+});
+
+// ---- Outro "Next Episode" button (stacked above Skip Credits) -------------------------
+
+function creditsProfile(overrides = {}) {
+    return profile({ credits: "button", ...overrides });
+}
+
+test("outro: credits=Button with next available stacks Next Episode and Skip Credits", () => {
+    const credits = segment("credits", 80_000, 95_000);
+    const machine = new PlaybackActionStateMachine({ actionsEnabled: true });
+    const decision = observe(machine, { positionMs: 85_000, nowMs: 0, segments: [credits], currentProfile: creditsProfile(), nextAvailable: true });
+    assert.equal(decision.nextButtonAction.kind, "next");
+    assert.equal(decision.nextButtonAction.mode, "withCredits");
+    assert.equal(decision.nextButtonAction.label, "Next Episode");
+    assert.equal(decision.buttonAction.kind, "segment");
+    assert.equal(decision.buttonAction.label, "Skip Credits");
+    assert.equal(decision.automaticAction, null);
+});
+
+test("outro: without a verified next episode only Skip Credits shows", () => {
+    const credits = segment("credits", 80_000, 95_000);
+    const machine = new PlaybackActionStateMachine({ actionsEnabled: true });
+    const decision = observe(machine, { positionMs: 85_000, nowMs: 0, segments: [credits], currentProfile: creditsProfile(), nextAvailable: false });
+    assert.equal(decision.nextButtonAction, null);
+    assert.equal(decision.buttonAction.label, "Skip Credits");
+});
+
+test("outro: intro, recap and preview never get a Next Episode button", () => {
+    for (const type of ["intro", "recap", "preview"]) {
+        const region = segment(type, 10_000, 30_000);
+        const machine = new PlaybackActionStateMachine({ actionsEnabled: true });
+        const decision = observe(machine, {
+            positionMs: 15_000,
+            nowMs: 0,
+            segments: [region],
+            currentProfile: creditsProfile({ [type]: "button" }),
+            nextAvailable: true,
+        });
+        assert.equal(decision.nextButtonAction, null, type);
+        assert.ok(decision.buttonAction, type);
+    }
+});
+
+test("outro: credits Auto or Off never shows Next Episode, and a failed next blocks repeats", () => {
+    const credits = segment("credits", 80_000, 95_000);
+    for (const mode of ["auto", "none"]) {
+        const machine = new PlaybackActionStateMachine({ actionsEnabled: true });
+        observe(machine, { positionMs: 79_000, nowMs: 0, segments: [credits], currentProfile: creditsProfile({ credits: mode }), nextAvailable: true });
+        const decision = observe(machine, { positionMs: 85_000, nowMs: 100, segments: [credits], currentProfile: creditsProfile({ credits: mode }), nextAvailable: true });
+        assert.equal(decision.nextButtonAction, null, mode);
+    }
+    const machine = new PlaybackActionStateMachine({ actionsEnabled: true });
+    const first = observe(machine, { positionMs: 85_000, nowMs: 0, segments: [credits], currentProfile: creditsProfile(), nextAvailable: true }).nextButtonAction;
+    assert.equal(machine.reserve(first), true);
+    machine.complete(first, false, 0);
+    assert.equal(observe(machine, { positionMs: 85_100, nowMs: 100, segments: [credits], currentProfile: creditsProfile(), nextAvailable: true }).nextButtonAction, null);
+});
+
+test("outro: renderer stacks buttons top-to-bottom and one click disables and clears both", async () => {
+    const fixture = playerDom();
+    const renderer = new PlayerActionRenderer(fixture.documentObject, { actionsEnabled: true });
+    const next = { kind: "next", mode: "withCredits", id: "next:withCredits:c", segmentId: "c", label: "Next Episode" };
+    const skip = { kind: "segment", mode: "button", id: "c", segmentType: "credits", label: "Skip Credits" };
+    let calls = [];
+    assert.equal(renderer.render([next, skip], "ctx", async (action) => { calls.push(action.kind); }, () => true), true);
+    assert.equal(fixture.documentObject.querySelectorAll("[data-showskip-playback-action-root]").length, 1);
+    assert.deepEqual(renderer.root.children.map((child) => child.textContent), ["Next Episode", "Skip Credits"]);
+    assert.deepEqual(renderer.root.children.map((child) => child.getAttribute("aria-label")), ["Next Episode", "Skip Credits"]);
+    const [nextButton, skipButton] = renderer.buttons;
+    nextButton.dispatch("click");
+    assert.equal(skipButton.disabled, true);
+    skipButton.dispatch("click");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(calls, ["next"]);
+    assert.equal(fixture.documentObject.querySelectorAll("[data-showskip-playback-action-root]").length, 0);
+});
+
+test("outro: stream codec round-trips and matches core's stored-block zlib framing", async () => {
+    const stream = { url: "https://cdn.example/v/ep1.mkv", name: "Addon\n1080p", behaviorHints: { bingeGroup: "addon|1080p" }, description: "é✓" };
+    const encoded = hooks.encodeRouteStream(stream);
+    assert.match(encoded, /^[A-Za-z0-9%]+$/u);
+    const bytes = Buffer.from(decodeURIComponent(encoded), "base64");
+    assert.equal(bytes[0], 0x78);
+    assert.equal(bytes[1], 0x01);
+    assert.equal(bytes[2], 1);
+    assert.deepEqual(plain(await hooks.decodeRouteStream(encoded, undefined)), stream);
+    // Node's real zlib can read our framing (proves valid zlib + Adler-32), and we can read real zlib output.
+    const zlib = require("node:zlib");
+    assert.equal(zlib.inflateSync(bytes).toString("utf8"), JSON.stringify(stream));
+    const compressed = encodeURIComponent(zlib.deflateSync(Buffer.from(JSON.stringify(stream))).toString("base64"));
+    const viaStreams = await hooks.decodeRouteStream(compressed, {
+        DecompressionStream: globalThis.DecompressionStream,
+        Response: globalThis.Response,
+    });
+    assert.deepEqual(plain(viaStreams), stream);
+    assert.equal(await hooks.decodeRouteStream("%%%", undefined), null);
+    assert.equal(await hooks.decodeRouteStream("", undefined), null);
+});
+
+test("outro: stream codec splits large payloads into multiple stored blocks", async () => {
+    const stream = { url: "https://cdn.example/x", description: "x".repeat(70_000) };
+    const encoded = hooks.encodeRouteStream(stream);
+    const zlib = require("node:zlib");
+    assert.equal(zlib.inflateSync(Buffer.from(decodeURIComponent(encoded), "base64")).toString("utf8"), JSON.stringify(stream));
+});
+
+test("outro: route exposes raw stream parts needed to build the next player route", () => {
+    const route = hooks.parseRoute("#/player/ENC/https%3A%2F%2Fa.example%2Fmanifest.json/https%3A%2F%2Fm.example%2Fmanifest.json/series/tt1234567/tt1234567%3A1%3A2");
+    assert.equal(route.eligible, true);
+    assert.equal(route.encodedStream, "ENC");
+    assert.equal(route.streamTransportUrl, "https://a.example/manifest.json");
+    assert.equal(route.encodedStreamTransport, "https%3A%2F%2Fa.example%2Fmanifest.json");
+    assert.equal(route.encodedMetaTransport, "https%3A%2F%2Fm.example%2Fmanifest.json");
+});
+
+function nextResolverHarness({ streams, status = 200, current = { url: "https://cdn/ep1", behaviorHints: { bingeGroup: "g|1080p" } }, streamTransportUrl = "https://addon.example/cfg/manifest.json", throwFetch = false } = {}) {
+    const requests = [];
+    const reports = [];
+    const resolver = new hooks.NextStreamResolver({
+        fetch: async (url, init) => {
+            requests.push({ url, init });
+            if (throwFetch) throw new Error("network");
+            return new Response(JSON.stringify({ streams }), { status });
+        },
+        windowObject: { DecompressionStream: globalThis.DecompressionStream, Response: globalThis.Response },
+        debug: { report: (_scope, code) => reports.push(code) },
+        AbortController,
+        setTimeout,
+        clearTimeout,
+    });
+    const route = {
+        kind: "player",
+        signature: "sig",
+        type: "series",
+        metaId: "tt1234567",
+        videoId: "tt1234567:1:1",
+        streamTransportUrl,
+        encodedStream: current ? hooks.encodeRouteStream(current) : "",
+    };
+    return { resolver, route, requests, reports };
+}
+
+const ep2Streams = [
+    { url: "https://cdn/other-720", behaviorHints: { bingeGroup: "g|720p" } },
+    { url: "https://cdn/ep2-1080-a", behaviorHints: { bingeGroup: "g|1080p" } },
+    { url: "https://cdn/ep2-1080-b", behaviorHints: { bingeGroup: "g|1080p" } },
+];
+
+test("outro: resolver picks the first bingeGroup match from the same addon only", async () => {
+    const harness = nextResolverHarness({ streams: ep2Streams });
+    const result = await harness.resolver.resolve(harness.route, "tt1234567:1:2", undefined);
+    assert.equal(result.kind, "stream");
+    assert.equal(result.stream.url, "https://cdn/ep2-1080-a");
+    assert.equal(harness.requests.length, 1);
+    assert.equal(harness.requests[0].url, "https://addon.example/cfg/stream/series/tt1234567%3A1%3A2.json");
+    assert.equal(harness.requests[0].init.credentials, "omit");
+    assert.equal(harness.requests[0].init.redirect, "error");
+    assert.deepEqual(harness.reports, ["next:binge-match"]);
+});
+
+test("outro: resolver falls back to the stream list when nothing is proven", async () => {
+    const cases = {
+        "no current bingeGroup": nextResolverHarness({ streams: ep2Streams, current: { url: "https://cdn/ep1" } }),
+        "undecodable current stream": nextResolverHarness({ streams: ep2Streams, current: null }),
+        "no matching group": nextResolverHarness({ streams: [{ url: "https://cdn/z", behaviorHints: { bingeGroup: "other" } }] }),
+        "match not directly playable": nextResolverHarness({ streams: [{ externalUrl: "https://x", behaviorHints: { bingeGroup: "g|1080p" } }] }),
+        "http error": nextResolverHarness({ streams: [], status: 500 }),
+        "network error": nextResolverHarness({ streams: [], throwFetch: true }),
+        "bad body": nextResolverHarness({ streams: "nope" }),
+        "insecure transport": nextResolverHarness({ streams: ep2Streams, streamTransportUrl: "http://addon.example/manifest.json" }),
+        "transport with query": nextResolverHarness({ streams: ep2Streams, streamTransportUrl: "https://addon.example/manifest.json?x=1" }),
+        "transport with credentials": nextResolverHarness({ streams: ep2Streams, streamTransportUrl: "https://u:p@addon.example/manifest.json" }),
+        "transport not a manifest": nextResolverHarness({ streams: ep2Streams, streamTransportUrl: "https://addon.example/other.json" }),
+    };
+    for (const [name, harness] of Object.entries(cases)) {
+        const result = await harness.resolver.resolve(harness.route, "tt1234567:1:2", undefined);
+        assert.equal(result.kind, "picker", name);
+        assert.ok(harness.reports.every((code) => code.startsWith("next:picker:")), name);
+    }
+    for (const name of ["insecure transport", "transport with query", "transport with credentials", "transport not a manifest", "no current bingeGroup", "undecodable current stream"]) {
+        assert.equal(cases[name].requests.length, 0, `${name} must not fetch`);
+    }
+});
+
+function driverHarness({ nextVideo, streams = ep2Streams, current } = {}) {
+    const dispatched = [];
+    const replaced = [];
+    const route = {
+        kind: "player",
+        eligible: true,
+        signature: "sig",
+        type: "series",
+        metaId: "tt1234567",
+        videoId: "tt1234567:1:1",
+        season: 1,
+        episode: 1,
+        episodeFormat: "season-episode",
+        streamTransportUrl: "https://addon.example/cfg/manifest.json",
+        encodedStreamTransport: "https%3A%2F%2Faddon.example%2Fcfg%2Fmanifest.json",
+        encodedMetaTransport: "https%3A%2F%2Fmeta.example%2Fmanifest.json",
+        encodedStream: hooks.encodeRouteStream(current || { url: "https://cdn/ep1", behaviorHints: { bingeGroup: "g|1080p" } }),
+    };
+    const coreState = {
+        metaItem: { type: "Ready", content: { type: "series", id: "tt1234567" } },
+        seriesInfo: { season: 1, episode: 1 },
+        nextVideo,
+    };
+    const windowObject = {
+        DecompressionStream: globalThis.DecompressionStream,
+        Response: globalThis.Response,
+        location: { replace: (hash) => replaced.push(hash) },
+        services: { core: { transport: { dispatch: (...args) => dispatched.push(args) } } },
+    };
+    const driver = new hooks.NextEpisodeDriver({
+        windowObject,
+        coreStateReader: { read: async () => [coreState] },
+        resolver: new hooks.NextStreamResolver({
+            fetch: async () => new Response(JSON.stringify({ streams }), { status: 200 }),
+            windowObject,
+            AbortController,
+            setTimeout,
+            clearTimeout,
+        }),
+        getRoute: () => route,
+    });
+    return { driver, route, dispatched, replaced };
+}
+
+const nextVideoInfo = {
+    id: "tt1234567:1:2",
+    deepLinks: { metaDetailsStreams: "stremio:///detail/series/tt1234567/tt1234567%3A1%3A2", player: null },
+};
+
+test("outro: driver reports availability only from core nextVideo for this route", async () => {
+    const present = driverHarness({ nextVideo: nextVideoInfo });
+    assert.deepEqual(plain(present.driver.readAvailability({ routeSignature: "sig" })), { known: false, available: false });
+    await present.driver.refresh(present.route);
+    assert.deepEqual(plain(present.driver.readAvailability({ routeSignature: "sig" })), { known: true, available: true });
+    assert.deepEqual(plain(present.driver.readAvailability({ routeSignature: "other" })), { known: false, available: false });
+
+    for (const nextVideo of [null, undefined, { id: "tt1234567:1:1" }, { id: "bad\u0001id" }]) {
+        const absent = driverHarness({ nextVideo });
+        await absent.driver.refresh(absent.route);
+        assert.deepEqual(plain(absent.driver.readAvailability({ routeSignature: "sig" })), { known: true, available: false });
+    }
+});
+
+test("outro: driver plays the binge-matched stream on the same addon route", async () => {
+    const harness = driverHarness({ nextVideo: nextVideoInfo });
+    assert.equal(await harness.driver.transition({ routeSignature: "sig" }, undefined), true);
+    assert.deepEqual(plain(harness.dispatched), [[{ action: "Player", args: { action: "NextVideo" } }, "player"]]);
+    assert.equal(harness.replaced.length, 1);
+    const hash = harness.replaced[0];
+    const parts = hash.split("/");
+    assert.equal(parts[0], "#");
+    assert.equal(parts[1], "player");
+    assert.equal(parts[3], "https%3A%2F%2Faddon.example%2Fcfg%2Fmanifest.json");
+    assert.equal(parts[4], "https%3A%2F%2Fmeta.example%2Fmanifest.json");
+    assert.deepEqual(parts.slice(5), ["series", "tt1234567", "tt1234567%3A1%3A2"]);
+    const stream = await hooks.decodeRouteStream(parts[2], undefined);
+    assert.equal(stream.url, "https://cdn/ep2-1080-a");
+    // The new route must itself parse as an eligible player route for the next episode.
+    const reparsed = hooks.parseRoute(hash);
+    assert.equal(reparsed.eligible, true);
+    assert.equal(reparsed.videoId, "tt1234567:1:2");
+    assert.equal(reparsed.episode, 2);
+});
+
+test("outro: driver opens the next episode's stream list when no stream is proven", async () => {
+    const harness = driverHarness({ nextVideo: nextVideoInfo, streams: [{ url: "https://cdn/x", behaviorHints: { bingeGroup: "nope" } }] });
+    assert.equal(await harness.driver.transition({ routeSignature: "sig" }, undefined), true);
+    assert.deepEqual(harness.replaced, ["#/detail/series/tt1234567/tt1234567%3A1%3A2"]);
+    assert.equal(harness.dispatched.length, 1);
+});
+
+test("outro: driver refuses stale routes, missing next episode and aborted signals", async () => {
+    const stale = driverHarness({ nextVideo: nextVideoInfo });
+    assert.equal(await stale.driver.transition({ routeSignature: "different" }, undefined), false);
+    const none = driverHarness({ nextVideo: null });
+    assert.equal(await none.driver.transition({ routeSignature: "sig" }, undefined), false);
+    assert.equal(none.replaced.length, 0);
+    assert.equal(none.dispatched.length, 0);
+    const aborted = driverHarness({ nextVideo: nextVideoInfo });
+    const controller = new AbortController();
+    controller.abort();
+    assert.equal(await aborted.driver.transition({ routeSignature: "sig" }, controller.signal), false);
+    assert.equal(aborted.replaced.length, 0);
+});
+
+test("outro: driver still navigates when core dispatch is unavailable or throws", async () => {
+    const harness = driverHarness({ nextVideo: nextVideoInfo });
+    harness.driver.window.services = { core: { transport: { dispatch() { throw new Error("boom"); } } } };
+    assert.equal(await harness.driver.transition({ routeSignature: "sig" }, undefined), true);
+    assert.equal(harness.replaced.length, 1);
 });

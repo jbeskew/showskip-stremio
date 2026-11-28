@@ -375,6 +375,14 @@
         return { episode: Number(rest) };
     }
 
+    function decodeOrNull(part) {
+        try {
+            return decodeURIComponent(part);
+        } catch (_error) {
+            return null;
+        }
+    }
+
     function parseRoute(hash, limits = LIMITS) {
         if (typeof hash !== "string" || hash.length > 16_384) {
             return { kind: "other" };
@@ -450,6 +458,10 @@
                 showKey,
                 episodeFormat: fullIdentity ? "season-episode" : (singleIdentity ? "single" : null),
                 metaTransportUrl,
+                streamTransportUrl: decodeOrNull(encodedParts[2]),
+                encodedStream: encodedParts[1],
+                encodedStreamTransport: encodedParts[2],
+                encodedMetaTransport: encodedParts[3],
                 season: fullIdentity ? fullIdentity.season : null,
                 episode: episodeIdentity ? episodeIdentity.episode : null,
                 signature: JSON.stringify(["player", stableHash(value), type, metaId, videoId]),
@@ -1379,6 +1391,10 @@
         "provider:rate-limited",
         "provider:daily-limit",
         "media:unsupported",
+        "next:binge-match",
+        "next:picker:no-match",
+        "next:picker:fetch-failed",
+        "next:picker:unsupported",
     ]));
 
     function createDebugReporter(windowObject, options = {}) {
@@ -1635,6 +1651,376 @@
             this.controllers.clear();
             this.inFlight.clear();
             this.cache.clear();
+        }
+    }
+
+    // ---- Outro "Next Episode" driver -------------------------------------------------
+    // Next episode identity comes only from Stremio core (`player.nextVideo`). The stream is
+    // fetched from the SAME addon the current stream came from and chosen by matching
+    // `behaviorHints.bingeGroup` (the rule core itself uses for binge-watching). Anything
+    // unproven opens that episode's stream list instead of guessing a stream.
+    const NEXT_STREAM_LIMITS = Object.freeze({
+        maxResponseBytes: 2 * 1024 * 1024,
+        timeoutMs: 8_000,
+        maxStreams: 1_000,
+        maxEncodedStreamChars: 12_000,
+        coreRefreshMs: 2_000,
+    });
+
+    function bytesToBase64(bytes) {
+        let binary = "";
+        for (let index = 0; index < bytes.length; index += 0x8000) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(index, index + 0x8000));
+        }
+        return btoa(binary);
+    }
+
+    function base64ToBytes(text) {
+        const binary = atob(text);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+            bytes[index] = binary.charCodeAt(index);
+        }
+        return bytes;
+    }
+
+    function adler32(bytes) {
+        let a = 1;
+        let b = 0;
+        for (let index = 0; index < bytes.length; index += 1) {
+            a = (a + bytes[index]) % 65521;
+            b = (b + a) % 65521;
+        }
+        return ((b << 16) | a) >>> 0;
+    }
+
+    // Mirrors stremio-core `Stream::encode`: JSON -> zlib (stored blocks) -> base64 -> URI component.
+    function encodeRouteStream(stream) {
+        const json = new TextEncoder().encode(JSON.stringify(stream));
+        const blockMax = 31_745;
+        const blocks = Math.max(1, Math.ceil(json.length / blockMax));
+        const out = new Uint8Array(2 + json.length + (blocks * 5) + 4);
+        let offset = 0;
+        out[offset++] = 0x78;
+        out[offset++] = 0x01;
+        for (let block = 0; block < blocks; block += 1) {
+            const start = block * blockMax;
+            const length = Math.min(blockMax, json.length - start);
+            out[offset++] = block === blocks - 1 ? 1 : 0;
+            out[offset++] = length & 0xff;
+            out[offset++] = (length >>> 8) & 0xff;
+            out[offset++] = (~length) & 0xff;
+            out[offset++] = ((~length) >>> 8) & 0xff;
+            out.set(json.subarray(start, start + length), offset);
+            offset += length;
+        }
+        const checksum = adler32(json);
+        out[offset++] = (checksum >>> 24) & 0xff;
+        out[offset++] = (checksum >>> 16) & 0xff;
+        out[offset++] = (checksum >>> 8) & 0xff;
+        out[offset++] = checksum & 0xff;
+        return encodeURIComponent(bytesToBase64(out));
+    }
+
+    function inflateStoredZlib(bytes) {
+        if (bytes.length < 7 || (bytes[0] & 0x0f) !== 8 || ((bytes[0] << 8) | bytes[1]) % 31 !== 0) {
+            return null;
+        }
+        const chunks = [];
+        let offset = 2;
+        for (;;) {
+            if (offset + 5 > bytes.length) {
+                return null;
+            }
+            const header = bytes[offset];
+            const length = bytes[offset + 1] | (bytes[offset + 2] << 8);
+            const complement = bytes[offset + 3] | (bytes[offset + 4] << 8);
+            if ((header & 0x06) !== 0 || ((length ^ 0xffff) & 0xffff) !== complement) {
+                return null;
+            }
+            offset += 5;
+            if (offset + length > bytes.length) {
+                return null;
+            }
+            chunks.push(bytes.subarray(offset, offset + length));
+            offset += length;
+            if ((header & 1) === 1) {
+                break;
+            }
+        }
+        const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        const joined = new Uint8Array(total);
+        let position = 0;
+        for (const chunk of chunks) {
+            joined.set(chunk, position);
+            position += chunk.length;
+        }
+        return joined;
+    }
+
+    async function inflateZlib(bytes, windowObject) {
+        const stored = inflateStoredZlib(bytes);
+        if (stored) {
+            return stored;
+        }
+        const Decompression = windowObject && windowObject.DecompressionStream;
+        if (typeof Decompression !== "function" || typeof windowObject.Response !== "function") {
+            return null;
+        }
+        const stream = new windowObject.Response(bytes).body.pipeThrough(new Decompression("deflate"));
+        return new Uint8Array(await new windowObject.Response(stream).arrayBuffer());
+    }
+
+    async function decodeRouteStream(encodedPart, windowObject) {
+        try {
+            if (typeof encodedPart !== "string" || encodedPart.length === 0
+                || encodedPart.length > NEXT_STREAM_LIMITS.maxEncodedStreamChars) {
+                return null;
+            }
+            const bytes = await inflateZlib(base64ToBytes(decodeURIComponent(encodedPart)), windowObject);
+            if (!bytes || bytes.length === 0 || bytes.length > NEXT_STREAM_LIMITS.maxEncodedStreamChars * 4) {
+                return null;
+            }
+            const stream = JSON.parse(new TextDecoder().decode(bytes));
+            return isPlainObject(stream) ? stream : null;
+        } catch (_error) {
+            return null;
+        }
+    }
+
+    function buildAddonStreamUrl(streamTransportUrl, type, videoId) {
+        if (typeof streamTransportUrl !== "string" || type !== "series" || !isSafeMetaId(videoId)) {
+            return null;
+        }
+        let url;
+        try {
+            url = new URL(streamTransportUrl);
+        } catch (_error) {
+            return null;
+        }
+        if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash
+            || !url.pathname.endsWith("/manifest.json")) {
+            return null;
+        }
+        const basePath = url.pathname.slice(0, url.pathname.length - "manifest.json".length);
+        return `${url.origin}${basePath}stream/series/${encodeURIComponent(videoId)}.json`;
+    }
+
+    function bingeGroupOf(stream) {
+        const hints = isPlainObject(stream) ? ownValue(stream, "behaviorHints") : undefined;
+        const group = isPlainObject(hints) ? ownValue(hints, "bingeGroup") : undefined;
+        return typeof group === "string" && group.length > 0 && group.length <= 512 ? group : null;
+    }
+
+    // Only streams Stremio can open straight from a player route.
+    function isDirectlyPlayableStream(stream) {
+        if (!isPlainObject(stream)) {
+            return false;
+        }
+        const url = ownValue(stream, "url");
+        const infoHash = ownValue(stream, "infoHash");
+        return (typeof url === "string" && /^https?:\/\//iu.test(url))
+            || (typeof infoHash === "string" && /^[0-9a-f]{40}$/iu.test(infoHash));
+    }
+
+    // Same choice core makes: first stream in addon order sharing the current bingeGroup.
+    function pickBingeMatch(streams, currentGroup) {
+        if (!currentGroup || !Array.isArray(streams)) {
+            return null;
+        }
+        const match = streams.find((stream) => bingeGroupOf(stream) === currentGroup);
+        return match && isDirectlyPlayableStream(match) ? match : null;
+    }
+
+    class NextStreamResolver {
+        constructor(options = {}) {
+            this.fetch = options.fetch;
+            this.windowObject = options.windowObject || null;
+            this.setTimeout = options.setTimeout || setTimeout;
+            this.clearTimeout = options.clearTimeout || clearTimeout;
+            this.AbortController = hasOwn(options, "AbortController")
+                ? options.AbortController
+                : globalThis.AbortController;
+            this.debug = options.debug || null;
+            this.timeoutMs = options.timeoutMs || NEXT_STREAM_LIMITS.timeoutMs;
+        }
+
+        _picker(route, code) {
+            if (this.debug) {
+                this.debug.report(String(route && route.signature), code);
+            }
+            return Object.freeze({ kind: "picker" });
+        }
+
+        async resolve(route, nextVideoId, signal) {
+            const url = route ? buildAddonStreamUrl(route.streamTransportUrl, route.type, nextVideoId) : null;
+            if (!url || typeof this.fetch !== "function" || typeof this.AbortController !== "function") {
+                return this._picker(route, "next:picker:unsupported");
+            }
+            const current = await decodeRouteStream(route.encodedStream, this.windowObject);
+            const group = bingeGroupOf(current);
+            if (!group) {
+                return this._picker(route, "next:picker:no-match");
+            }
+            const controller = new this.AbortController();
+            const onAbort = () => controller.abort();
+            if (signal) {
+                if (signal.aborted) {
+                    throw abortError();
+                }
+                signal.addEventListener("abort", onAbort, { once: true });
+            }
+            const timeout = this.setTimeout(() => controller.abort(), this.timeoutMs);
+            try {
+                const response = await this.fetch(url, {
+                    method: "GET",
+                    headers: { Accept: "application/json" },
+                    credentials: "omit",
+                    cache: "default",
+                    redirect: "error",
+                    referrerPolicy: "no-referrer",
+                    signal: controller.signal,
+                });
+                if (!response || response.status !== 200) {
+                    return this._picker(route, "next:picker:fetch-failed");
+                }
+                const body = await readBoundedJson(response, NEXT_STREAM_LIMITS.maxResponseBytes);
+                const streams = isPlainObject(body) ? ownValue(body, "streams") : undefined;
+                if (!Array.isArray(streams) || streams.length > NEXT_STREAM_LIMITS.maxStreams) {
+                    return this._picker(route, "next:picker:fetch-failed");
+                }
+                const match = pickBingeMatch(streams, group);
+                if (!match) {
+                    return this._picker(route, "next:picker:no-match");
+                }
+                if (this.debug) {
+                    this.debug.report(String(route.signature), "next:binge-match");
+                }
+                return Object.freeze({ kind: "stream", stream: match });
+            } catch (_error) {
+                if (signal && signal.aborted) {
+                    throw abortError();
+                }
+                return this._picker(route, "next:picker:fetch-failed");
+            } finally {
+                this.clearTimeout(timeout);
+                if (signal) {
+                    signal.removeEventListener("abort", onAbort);
+                }
+            }
+        }
+    }
+
+    class NextEpisodeDriver {
+        constructor(options = {}) {
+            this.window = options.windowObject;
+            this.coreStateReader = options.coreStateReader;
+            this.resolver = options.resolver;
+            this.getRoute = typeof options.getRoute === "function" ? options.getRoute : () => null;
+            this.now = options.now || Date.now;
+            this.cache = null;
+            this.refreshing = null;
+            this.lastRefreshMs = -Infinity;
+        }
+
+        // Fire-and-forget; availability is then read synchronously from the cache.
+        maybeRefresh(route) {
+            if (!route || route.kind !== "player" || this.refreshing) {
+                return;
+            }
+            const fresh = this.cache && this.cache.routeSignature === route.signature
+                && this.now() - this.lastRefreshMs < NEXT_STREAM_LIMITS.coreRefreshMs;
+            if (fresh) {
+                return;
+            }
+            this.refreshing = this.refresh(route).catch(() => undefined).finally(() => {
+                this.refreshing = null;
+            });
+        }
+
+        async refresh(route, signal) {
+            const states = await this.coreStateReader.read(signal);
+            let entry = null;
+            for (const state of states) {
+                if (classifyCorePlayerState(state, route).kind !== "match") {
+                    continue;
+                }
+                const nextVideo = ownValue(state, "nextVideo");
+                const id = isPlainObject(nextVideo) ? ownValue(nextVideo, "id") : undefined;
+                const links = isPlainObject(nextVideo) ? ownValue(nextVideo, "deepLinks") : undefined;
+                const detail = isPlainObject(links) ? ownValue(links, "metaDetailsStreams") : undefined;
+                entry = {
+                    routeSignature: route.signature,
+                    available: typeof id === "string" && id !== route.videoId && isSafeMetaId(id),
+                    id: typeof id === "string" ? id : null,
+                    detailHash: typeof detail === "string" && /^stremio:\/\/\/detail\/[^\s#?]+$/u.test(detail)
+                        ? `#${detail.slice("stremio://".length)}`
+                        : null,
+                };
+                break;
+            }
+            this.cache = entry;
+            this.lastRefreshMs = this.now();
+            return entry;
+        }
+
+        readAvailability(context) {
+            const entry = this.cache;
+            if (!entry || !context || entry.routeSignature !== context.routeSignature) {
+                return { known: false, available: false };
+            }
+            return { known: true, available: entry.available === true };
+        }
+
+        _dispatchNextVideo() {
+            const owners = [];
+            try {
+                owners.push(this.window.services && this.window.services.core
+                    && this.window.services.core.transport);
+                owners.push(this.window.core && this.window.core.transport);
+                owners.push(this.window.services && this.window.services.core);
+            } catch (_error) {
+                return;
+            }
+            for (const owner of owners) {
+                try {
+                    if (owner && typeof owner.dispatch === "function") {
+                        owner.dispatch({ action: "Player", args: { action: "NextVideo" } }, "player");
+                        return;
+                    }
+                } catch (_error) {
+                    // Library bookkeeping is best effort; navigation below still proceeds.
+                }
+            }
+        }
+
+        async transition(context, signal) {
+            const route = this.getRoute();
+            if (!route || route.kind !== "player" || route.signature !== context.routeSignature) {
+                return false;
+            }
+            const entry = await this.refresh(route, signal);
+            if ((signal && signal.aborted) || !entry || !entry.available) {
+                return false;
+            }
+            const resolved = await this.resolver.resolve(route, entry.id, signal);
+            if (signal && signal.aborted) {
+                return false;
+            }
+            let hash;
+            if (resolved.kind === "stream"
+                && typeof route.encodedStreamTransport === "string" && route.encodedStreamTransport.length > 0
+                && typeof route.encodedMetaTransport === "string") {
+                hash = `#/player/${encodeRouteStream(resolved.stream)}/${route.encodedStreamTransport}`
+                    + `/${route.encodedMetaTransport}/series/${encodeURIComponent(route.metaId)}`
+                    + `/${encodeURIComponent(entry.id)}`;
+            } else {
+                hash = entry.detailHash
+                    || `#/detail/series/${encodeURIComponent(route.metaId)}/${encodeURIComponent(entry.id)}`;
+            }
+            this._dispatchNextVideo();
+            this.window.location.replace(hash);
+            return true;
         }
     }
 
@@ -2150,8 +2536,8 @@
         }
     }
 
-    function actionResult(automaticAction = null, buttonAction = null, naturalForward = false) {
-        return Object.freeze({ automaticAction, buttonAction, naturalForward });
+    function actionResult(automaticAction = null, buttonAction = null, naturalForward = false, nextButtonAction = null) {
+        return Object.freeze({ automaticAction, buttonAction, naturalForward, nextButtonAction });
     }
 
     function segmentActionLabel(type) {
@@ -2384,13 +2770,32 @@
                 }
             }
 
+            // Outro only: with Credits = Button, a Next Episode button stacks above Skip Credits.
+            let nextButtonAction = null;
+            if (!this.nativeSeeking && input.seeking !== true
+                && !this.nextPending && !this.nextFired && !this.nextBlocked && nextAvailable
+                && ownValue(profile, "credits") === "button"
+                && ownValue(profile, "nextEpisode") !== "button") {
+                const outro = insideSegments.filter((segment) => segment.type === "credits")
+                    .sort(compareSegmentActions)[0];
+                if (outro) {
+                    nextButtonAction = Object.freeze({
+                        kind: "next",
+                        mode: "withCredits",
+                        id: `next:withCredits:${outro.id}`,
+                        segmentId: outro.id,
+                        label: "Next Episode",
+                    });
+                }
+            }
+
             if (eventType === "seeked" && !showSkipSeeking) {
                 this.nativeSeeking = false;
             }
             this.previousPositionMs = positionMs;
             this.previousWallMs = nowMs;
             this.lastNaturalForward = naturalForward;
-            return actionResult(automaticAction, buttonAction, naturalForward);
+            return actionResult(automaticAction, buttonAction, naturalForward, nextButtonAction);
         }
 
         reserve(action) {
@@ -2483,13 +2888,18 @@
             this.actionsEnabled = options.actionsEnabled === true;
             this.root = null;
             this.button = null;
+            this.buttons = [];
+            this.handlers = [];
             this.signature = null;
             this.clickHandler = null;
             this.busy = false;
         }
 
-        render(action, contextSignature, onActivate, isLive) {
-            if (!this.actionsEnabled || !action || typeof onActivate !== "function" || typeof isLive !== "function") {
+        // `actions` is one action or an ordered list; lists render as a top-to-bottom stack.
+        render(actions, contextSignature, onActivate, isLive) {
+            const list = (Array.isArray(actions) ? actions : [actions]).filter(Boolean);
+            if (!this.actionsEnabled || list.length === 0 || typeof onActivate !== "function"
+                || typeof isLive !== "function") {
                 this.clear();
                 return false;
             }
@@ -2499,7 +2909,8 @@
                 return false;
             }
             this._removeOtherRoots(this.root);
-            const signature = `${contextSignature}|${action.kind}|${action.mode}|${action.id}`;
+            const signature = `${contextSignature}|${list
+                .map((action) => `${action.kind}|${action.mode}|${action.id}`).join("+")}`;
             if (this.root && this.root.isConnected !== false && this.root.parentNode === target.player
                 && this.signature === signature) {
                 return true;
@@ -2508,54 +2919,63 @@
             const root = this.document.createElement("div");
             root.setAttribute("data-showskip-owned", "playback-action");
             root.setAttribute("data-showskip-playback-action-root", "");
-            const button = this.document.createElement("button");
-            button.setAttribute("type", "button");
-            button.setAttribute("data-showskip-playback-action", action.kind);
-            button.setAttribute("aria-label", action.label);
-            button.setAttribute("data-showskip-action-id", action.id);
-            if (action.segmentType) {
-                button.setAttribute("data-showskip-segment-type", action.segmentType);
-            }
-            button.type = "button";
-            button.textContent = action.label;
             this.root = root;
-            this.button = button;
             this.signature = signature;
             this.busy = false;
-            this.clickHandler = () => {
-                let live = false;
-                try {
-                    live = isLive(action, contextSignature) === true;
-                } catch (_error) {
-                    live = false;
+            for (const action of list) {
+                const button = this.document.createElement("button");
+                button.setAttribute("type", "button");
+                button.setAttribute("data-showskip-playback-action", action.kind);
+                button.setAttribute("aria-label", action.label);
+                button.setAttribute("data-showskip-action-id", action.id);
+                if (action.segmentType) {
+                    button.setAttribute("data-showskip-segment-type", action.segmentType);
                 }
-                if (this.busy || !this.actionsEnabled || this.button !== button
-                    || this.signature !== signature || root.isConnected === false || !live) {
-                    return;
-                }
-                this.busy = true;
-                button.disabled = true;
-                button.setAttribute("aria-busy", "true");
-                void Promise.resolve().then(() => onActivate(action, contextSignature)).catch(() => undefined).finally(() => {
-                    if (this.button === button && this.signature === signature) {
-                        this.clear();
+                button.type = "button";
+                button.textContent = action.label;
+                const handler = () => {
+                    let live = false;
+                    try {
+                        live = isLive(action, contextSignature) === true;
+                    } catch (_error) {
+                        live = false;
                     }
-                });
-            };
-            button.addEventListener("click", this.clickHandler);
-            root.appendChild(button);
+                    if (this.busy || !this.actionsEnabled || !this.buttons.includes(button)
+                        || this.signature !== signature || root.isConnected === false || !live) {
+                        return;
+                    }
+                    this.busy = true;
+                    for (const sibling of this.buttons) {
+                        sibling.disabled = true;
+                    }
+                    button.setAttribute("aria-busy", "true");
+                    void Promise.resolve().then(() => onActivate(action, contextSignature)).catch(() => undefined).finally(() => {
+                        if (this.buttons.includes(button) && this.signature === signature) {
+                            this.clear();
+                        }
+                    });
+                };
+                button.addEventListener("click", handler);
+                this.buttons.push(button);
+                this.handlers.push({ button, handler });
+                this.button = button;
+                this.clickHandler = handler;
+                root.appendChild(button);
+            }
             target.player.appendChild(root);
             this._removeOtherRoots(root);
             return true;
         }
 
         clear() {
-            if (this.button && this.clickHandler) {
-                this.button.removeEventListener("click", this.clickHandler);
+            for (const { button, handler } of this.handlers) {
+                button.removeEventListener("click", handler);
             }
             removeNode(this.root);
             this.root = null;
             this.button = null;
+            this.buttons = [];
+            this.handlers = [];
             this.signature = null;
             this.clickHandler = null;
             this.busy = false;
@@ -3504,9 +3924,12 @@
             this.actionRenderer = options.actionRenderer || new PlayerActionRenderer(this.document, {
                 actionsEnabled: this.actionsEnabled,
             });
+            this.nextDriver = options.nextDriver || null;
             this.nextAdapter = options.nextAdapter || new NextEpisodeAdapter({
                 actionsEnabled: this.actionsEnabled,
                 validateContext: (context) => this._actionContextIsLive(context),
+                readAvailability: this.nextDriver ? (context) => this.nextDriver.readAvailability(context) : null,
+                transition: this.nextDriver ? (context, signal) => this.nextDriver.transition(context, signal) : null,
             });
             this.route = null;
             this.identity = null;
@@ -3588,7 +4011,9 @@
                         || this.identity.showKey !== showKey || this.identity.identitySource !== "route+core") {
                         return false;
                     }
-                    this.profile = result && isPlainObject(result.profile) ? result.profile : null;
+                    this.profile = result && isPlainObject(result.profile)
+                        ? (this.nextDriver ? { ...result.profile, nextEpisode: "stremio" } : result.profile)
+                        : null;
                     this.profileShowKey = this.profile ? showKey : null;
                 } catch (_error) {
                     this.profile = null;
@@ -3926,6 +4351,9 @@
                 this.actionRenderer.clear();
                 return;
             }
+            if (this.nextDriver && ownValue(this.profile, "credits") === "button") {
+                this.nextDriver.maybeRefresh(this.route);
+            }
             let availability = nextAvailability(false, false, "mechanism-unavailable");
             if (this.nextAdapter && typeof this.nextAdapter.getAvailability === "function") {
                 availability = this.nextAdapter.getAvailability(context);
@@ -3950,9 +4378,10 @@
                 void this._executeAction(decision.automaticAction, context, contextSignature);
                 return;
             }
-            if (decision.buttonAction && !this.pendingAction) {
+            const stacked = [decision.nextButtonAction, decision.buttonAction].filter(Boolean);
+            if (stacked.length > 0 && !this.pendingAction) {
                 this.actionRenderer.render(
-                    decision.buttonAction,
+                    stacked.length === 1 ? stacked[0] : stacked,
                     contextSignature,
                     (action, signature) => this._activateButton(action, context, signature),
                     (action, signature) => this._buttonActionIsLive(action, context, signature),
@@ -3978,6 +4407,11 @@
             let availability = nextAvailability(false, false, "mechanism-unavailable");
             if (this.nextAdapter && typeof this.nextAdapter.getAvailability === "function") {
                 availability = this.nextAdapter.getAvailability(context);
+            }
+            if (action.kind === "next" && action.mode === "withCredits") {
+                return ownValue(this.profile, "credits") === "button"
+                    && availability.known && availability.available
+                    && inside.some((segment) => segment.type === "credits" && segment.id === action.segmentId);
             }
             if (action.kind === "next") {
                 return ownValue(this.profile, "nextEpisode") === "button"
@@ -4357,7 +4791,9 @@
                 bottom: max(5.25rem, calc(env(safe-area-inset-bottom) + 4rem));
                 z-index: 4;
                 display: flex;
-                justify-content: flex-end;
+                flex-direction: column;
+                align-items: flex-end;
+                gap: 0.5rem;
                 pointer-events: none;
             }
             [data-showskip-playback-action] {
@@ -5094,6 +5530,19 @@
                 AbortController: windowObject.AbortController,
                 debug: this.debug,
             });
+            this.nextEpisodeDriver = new NextEpisodeDriver({
+                windowObject,
+                coreStateReader: this.coreStateReader,
+                resolver: new NextStreamResolver({
+                    fetch: typeof windowObject.fetch === "function" ? windowObject.fetch.bind(windowObject) : null,
+                    windowObject,
+                    setTimeout: windowObject.setTimeout.bind(windowObject),
+                    clearTimeout: windowObject.clearTimeout.bind(windowObject),
+                    AbortController: windowObject.AbortController,
+                    debug: this.debug,
+                }),
+                getRoute: () => this.contextDetector.current(),
+            });
             this.episodeIdentityProvider = new EpisodeIdentityProvider(
                 this.contextDetector,
                 this.coreStateReader,
@@ -5125,6 +5574,7 @@
                 actionsEnabled: PHASE3_PLAYBACK_ACTIONS_ENABLED,
                 getProfile: (showKey) => this.store.getOrCreateProfile(showKey),
                 getCurrentRoute: () => this.contextDetector.current(),
+                nextDriver: this.nextEpisodeDriver,
             });
             this.documentObserver = null;
             this.loaderObserver = null;
@@ -5366,6 +5816,8 @@
                 EpisodeIdentityProvider,
                 HtmlMediaAdapter,
                 NextEpisodeAdapter,
+                NextEpisodeDriver,
+                NextStreamResolver,
                 PlaybackActionStateMachine,
                 PlayerController,
                 PlayerActionRenderer,
@@ -5383,6 +5835,8 @@
                 createDefaultProfile,
                 extractAddonMappings,
                 createStyles,
+                decodeRouteStream,
+                encodeRouteStream,
                 ensureSingleOwnedNode,
                 formatTimelineTime,
                 inspectJsonValue,
